@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     windows = NSScreen.screens.map { screen in
       let window = SelectionWindow(
-        contentRect: screen.frame,
+        contentRect: NSRect(origin: .zero, size: screen.frame.size),
         styleMask: .borderless,
         backing: .buffered,
         defer: false,
