@@ -106,11 +106,15 @@ src/
 Two spaces, converted at the edges of the core:
 
 - **logical** — what the compositor or window server reports for the cursor and
-  window geometry. The gesture state machine, the click/drag threshold and the
-  `W x H px` badge all work in logical units, exactly like the original.
+  window geometry, and therefore what `--pick`, `--shot` and `hyprctl cursorpos`
+  speak. The gesture state machine and the click/drag threshold work in these
+  units.
 - **physical** — real device pixels. On a 4096x1728 logical output at 1.25x that
-  is 5120x2160. Sampling, cropping and encoding happen here, so a picked colour
-  is a real screen pixel.
+  is 5120x2160. Sampling, cropping, encoding and the `W x H px` readout all
+  happen here, so a picked colour is a real screen pixel and the readout is the
+  size of the image you actually get: a 500x400 logical drag reports `625 x 500`
+  and produces a 625x500 PNG. The original AppKit app counted logical units
+  instead, so its readout was always smaller than the screenshot it made.
 
 The per-output scale is never guessed from `wl_output.scale` (an integer, so
 useless at 1.25x) or from `backingScaleFactor` alone: it is derived from the
@@ -229,10 +233,11 @@ checked against `grim` and `wl-paste` on the same screen:
   all four edges are a white 1-2px line at the selection, every sampled interior
   pixel is undimmed against a pre-overlay grab, every sampled exterior pixel is
   dimmed, and the `W × H px` pill beside the cursor decodes glyph by glyph to
-  `500×375 px` (1800/1800 sampled pixels). Moving the cursor mid drag redraws the
-  pill at the new corner and leaves nothing behind at the old one. The screenshot
-  that lands on the clipboard is 500x375 for that logical 400x300 selection, and
-  matches a `grim` grab of the same region.
+  `500×375 px` (1800/1800 sampled pixels) for a logical 400x300 drag, and to
+  `625×500 px` (1800/1800) for a logical 500x400 one - the physical size each
+  time. Moving the cursor mid drag redraws the pill at the new corner and leaves
+  nothing behind at the old one. The screenshot that lands on the clipboard is
+  500x375 for that 400x300 selection, and matches a `grim` grab of the region.
 
 Not exercised here: Escape and right-click cancel (no way to inject keys or
 buttons without another client on this box - the keyboard is grabbed exclusively
