@@ -11,6 +11,7 @@
 //!    `signed char` (x86_64) return 0/1 in the low byte.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const id = ?*anyopaque;
 pub const SEL = ?*anyopaque;
@@ -109,7 +110,11 @@ pub inline fn msgSend(comptime Return: type, receiver: id, selector: SEL, args: 
 pub const Method = struct {
     name: [*:0]const u8,
     imp: IMP,
+    types: [*:0]const u8,
 };
+
+pub const bool_no_args: [*:0]const u8 = if (builtin.cpu.arch == .aarch64) "B@:" else "c@:";
+pub const bool_object_arg: [*:0]const u8 = if (builtin.cpu.arch == .aarch64) "B@:@" else "c@:@";
 
 /// Define a subclass of `superclass` and register the given methods.
 pub fn defineClass(
@@ -119,7 +124,7 @@ pub fn defineClass(
 ) Class {
     const cls = objc_allocateClassPair(superclass, name, 0) orelse return null;
     for (methods) |method| {
-        _ = class_addMethod(cls, sel_registerName(method.name), method.imp, "v@:");
+        _ = class_addMethod(cls, sel_registerName(method.name), method.imp, method.types);
     }
     objc_registerClassPair(cls);
     return cls;
@@ -160,6 +165,7 @@ pub extern "c" fn CGBitmapContextCreate(
     bitmap_info: u32,
 ) ?CGContextRef;
 pub extern "c" fn CGBitmapContextGetData(context: CGContextRef) ?*anyopaque;
+pub extern "c" fn CGContextClipToRect(context: CGContextRef, rect: CGRect) void;
 pub extern "c" fn CGContextDrawImage(context: CGContextRef, rect: CGRect, image: CGImageRef) void;
 pub extern "c" fn CGContextSetInterpolationQuality(context: CGContextRef, quality: c_int) void;
 pub extern "c" fn CGContextRelease(context: CGContextRef) void;
@@ -171,7 +177,6 @@ pub extern "c" fn CGRequestScreenCaptureAccess() bool;
 pub const bitmap_info_argb8888: u32 = (2) | (2 << 12);
 
 pub const interpolation_none: c_int = 0;
-pub const interpolation_high: c_int = 3;
 
 // ---------------------------------------------------------------------------
 // AppKit / Foundation constants

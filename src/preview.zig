@@ -13,6 +13,7 @@ const geom = @import("core/geom.zig");
 const magnifier = @import("core/magnifier.zig");
 const overlay = @import("core/overlay.zig");
 const png = @import("core/png.zig");
+const sampling = @import("core/sampling.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -72,16 +73,7 @@ pub fn main(init: std.process.Init) !void {
 
     var sample = try canvas_mod.Canvas.init(allocator, magnifier.sample_side, magnifier.sample_side);
     defer sample.deinit();
-    var sy: i32 = 0;
-    while (sy < @as(i32, magnifier.sample_side)) : (sy += 1) {
-        var sx: i32 = 0;
-        while (sx < @as(i32, magnifier.sample_side)) : (sx += 1) {
-            sample.set(sx, sy, baseline.sample(
-                @as(i32, @intFromFloat(cursor.x)) - @as(i32, magnifier.sample_side / 2) + sx,
-                @as(i32, @intFromFloat(cursor.y)) - @as(i32, magnifier.sample_side / 2) + sy,
-            ));
-        }
-    }
+    sampling.fillSample(&sample, &baseline, 1, cursor);
     overlay.renderMagnifier(&frame, magnifier.windowOrigin(cursor, ui_scale), sample, ui_scale);
 
     const bytes = try png.encode(allocator, frame);

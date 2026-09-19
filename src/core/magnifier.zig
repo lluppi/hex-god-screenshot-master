@@ -12,9 +12,9 @@
 //! flipped.
 
 const std = @import("std");
+const badge = @import("badge.zig");
 const canvas_mod = @import("canvas.zig");
 const color = @import("color.zig");
-const font = @import("font.zig");
 const geom = @import("geom.zig");
 
 const Canvas = canvas_mod.Canvas;
@@ -196,19 +196,15 @@ fn drawHexBadge(canvas: *Canvas, window: Rect, sample: Canvas, ui_scale: f64) vo
 
 /// Rounded dark pill with white monospace text, horizontally centred in the
 /// window and sitting near its bottom edge.
-pub fn drawBadge(canvas: *Canvas, window: Rect, text: []const u8, ui_scale: f64) void {
-    const padding_x: i32 = @intFromFloat(@round(7 * ui_scale));
-    const padding_y: i32 = @intFromFloat(@round(4 * ui_scale));
-    const text_w = font.textWidth(text, ui_scale);
-    const text_h = font.cellHeight(ui_scale);
+fn drawBadge(canvas: *Canvas, window: Rect, text: []const u8, ui_scale: f64) void {
+    const metrics = badge.metrics(text, ui_scale);
     const width: i32 = @intFromFloat(@round(window_width * ui_scale));
     const height: i32 = @intFromFloat(@round(window_height * ui_scale));
-    const badge = Rect{
-        .x = window.x + @divTrunc(width - text_w - 2 * padding_x, 2),
-        .y = window.y + height - text_h - 2 * padding_y - @as(i32, @intFromFloat(@round(2 * ui_scale))),
-        .w = text_w + 2 * padding_x,
-        .h = text_h + 2 * padding_y,
+    const rect = Rect{
+        .x = window.x + @divTrunc(width - metrics.width, 2),
+        .y = window.y + height - metrics.height - @as(i32, @intFromFloat(@round(2 * ui_scale))),
+        .w = metrics.width,
+        .h = metrics.height,
     };
-    canvas.fillRoundedRect(badge, 5 * ui_scale, color.black(209));
-    font.draw(canvas, badge.x + padding_x, badge.y + padding_y, text, ui_scale, color.solid(.{ .r = 255, .g = 255, .b = 255 }));
+    badge.draw(canvas, rect, text, ui_scale);
 }

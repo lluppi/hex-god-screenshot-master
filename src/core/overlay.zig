@@ -14,9 +14,9 @@
 //!   4. the loupe, which the frontend draws separately on top
 
 const std = @import("std");
+const badge_mod = @import("badge.zig");
 const canvas_mod = @import("canvas.zig");
 const color = @import("color.zig");
-const font = @import("font.zig");
 const geom = @import("geom.zig");
 const magnifier = @import("magnifier.zig");
 
@@ -45,7 +45,7 @@ pub fn renderRegion(canvas: *Canvas, scene: Scene, region: Rect) void {
     defer canvas.clearClip();
 
     paintBaseline(canvas, scene, region);
-    if (scene.selection) |selection| paintSelection(canvas, scene, selection, region, scene.ui_scale);
+    if (scene.selection) |selection| paintSelection(canvas, scene, selection, region);
 }
 
 fn paintBaseline(canvas: *Canvas, scene: Scene, region: Rect) void {
@@ -53,23 +53,17 @@ fn paintBaseline(canvas: *Canvas, scene: Scene, region: Rect) void {
     canvas.dim(region, color.dim_numerator);
 }
 
-fn paintSelection(
-    canvas: *Canvas,
-    scene: Scene,
-    selection: Rect,
-    region: Rect,
-    ui_scale: f64,
-) void {
+fn paintSelection(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) void {
     if (!selection.intersects(region)) return;
     // Undimmed content inside the selection, so the user sees exactly what will
     // be captured.
     canvas.copyFrom(scene.baseline.*, selection.intersection(region));
     canvas.strokeRect(
         selection,
-        @max(1, @as(i32, @intFromFloat(@round(ui_scale)))),
+        @max(1, @as(i32, @intFromFloat(@round(scene.ui_scale)))),
         color.solid(.{ .r = 255, .g = 255, .b = 255 }),
     );
-    paintSizeBadge(canvas, scene, selection, region, ui_scale);
+    paintSizeBadge(canvas, scene, selection, region);
 }
 
 /// The "W x H px" pill that follows the cursor while dragging.
@@ -103,12 +97,7 @@ pub fn sizeBadge(
         .{ selection.w, selection.h },
     ) catch return null;
 
-    const padding_x: i32 = @intFromFloat(@round(7 * ui_scale));
-    const padding_y: i32 = @intFromFloat(@round(4 * ui_scale));
-    const text_w = font.textWidth(text, ui_scale);
-    const text_h = font.cellHeight(ui_scale);
-    const badge_w = text_w + 2 * padding_x;
-    const badge_h = text_h + 2 * padding_y;
+    const metrics = badge_mod.metrics(text, ui_scale);
 
     const offset: i32 = @intFromFloat(@round(14 * ui_scale));
     const margin: i32 = @intFromFloat(@round(8 * ui_scale));
@@ -117,16 +106,16 @@ pub fn sizeBadge(
     const origin_x = std.math.clamp(
         anchor_x + offset,
         margin,
-        @max(margin, canvas.w - badge_w - margin),
+        @max(margin, canvas.w - metrics.width - margin),
     );
     const origin_y = std.math.clamp(
         anchor_y + offset,
         margin,
-        @max(margin, canvas.h - badge_h - margin),
+        @max(margin, canvas.h - metrics.height - margin),
     );
 
     var badge = SizeBadge{
-        .rect = .{ .x = origin_x, .y = origin_y, .w = badge_w, .h = badge_h },
+        .rect = .{ .x = origin_x, .y = origin_y, .w = metrics.width, .h = metrics.height },
         .text = undefined,
         .len = text.len,
     };
@@ -134,34 +123,11 @@ pub fn sizeBadge(
     return badge;
 }
 
-fn paintSizeBadge(
-    canvas: *Canvas,
-    scene: Scene,
-    selection: Rect,
-    region: Rect,
-    ui_scale: f64,
-) void {
+fn paintSizeBadge(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) void {
     const cursor = scene.cursor orelse return;
-    const badge = sizeBadge(selection, cursor, ui_scale, canvas.rect()) orelse return;
+    const badge = sizeBadge(selection, cursor, scene.ui_scale, canvas.rect()) orelse return;
     if (!badge.rect.intersects(region)) return;
-
-    const padding_x: i32 = @intFromFloat(@round(7 * ui_scale));
-    const padding_y: i32 = @intFromFloat(@round(4 * ui_scale));
-    canvas.fillRoundedRect(badge.rect, 5 * ui_scale, color.black(209));
-    font.draw(
-        canvas,
-        badge.rect.x + padding_x,
-        badge.rect.y + padding_y,
-        badge.label(),
-        ui_scale,
-        color.solid(.{ .r = 255, .g = 255, .b = 255 }),
-    );
-}
-
-/// Region of the canvas the loupe touches, so frontends can damage and repaint
-/// exactly that much.
-pub fn magnifierRegion(origin: Point, ui_scale: f64) Rect {
-    return magnifier.windowRect(origin, ui_scale);
+    badge_mod.draw(canvas, badge.rect, badge.label(), scene.ui_scale);
 }
 
 /// Draw the loupe on top of the overlay content.

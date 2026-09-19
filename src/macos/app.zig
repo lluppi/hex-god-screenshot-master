@@ -16,9 +16,7 @@ const objc = @import("objc.zig");
 const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
 const color = @import("../core/color.zig");
-const gesture = @import("../core/gesture.zig");
-const magnifier = @import("../core/magnifier.zig");
-const overlay_mod = @import("../core/overlay.zig");
+const interaction_mod = @import("../core/interaction.zig");
 const sampling = @import("../core/sampling.zig");
 const png = @import("../core/png.zig");
 const cli = @import("../core/cli.zig");
@@ -37,6 +35,7 @@ const overlay_settle_ms: u64 = 60;
 const Display = struct {
     app: *App,
     id: objc.CGDirectDisplayID,
+    interaction_id: interaction_mod.SurfaceId = 0,
     /// Global logical rect, y down from the top-left of the primary display.
     logical: FRect = .{},
     /// Physical pixels per logical pixel.
@@ -47,17 +46,9 @@ const Display = struct {
     canvas: ?Canvas = null,
     window: id = null,
     view: id = null,
-    dirty: std.ArrayList(Rect) = .empty,
-    /// Where the size badge was last drawn, so the next move can erase it. The
-    /// badge sits outside the selection rectangle, so it needs its own damage.
-    last_badge: ?Rect = null,
 
     fn localLogical(self: *Display, global: Point) Point {
         return .{ .x = global.x - self.logical.x, .y = global.y - self.logical.y };
-    }
-
-    fn toPhysical(self: *Display, local: Point) Point {
-        return .{ .x = local.x * self.scale, .y = local.y * self.scale };
     }
 };
 
@@ -67,17 +58,8 @@ const App = struct {
     /// Bottom edge of the primary display in AppKit coordinates, used to flip
     /// between AppKit's y-up space and the core's y-down space.
     main_max_y: f64 = 0,
-    coordinator: gesture.Coordinator = .{},
-    cursor_display: ?*Display = null,
-    cursor_local: Point = .{},
-    cursor_global: Point = .{},
-    selection: ?FRect = null,
+    interaction: ?interaction_mod.Interaction = null,
     buttons: u32 = 0,
-    loupe_display: ?*Display = null,
-    loupe_origin: ?Point = null,
-    loupe_active: bool = false,
-    last_sample_hex: ?color.Rgb = null,
-    sample: ?Canvas = null,
     finished: bool = false,
     exit_code: u8 = 0,
 };
@@ -153,6 +135,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
         },
         .interactive => {
             try startOverlay(&app);
+            defer {
+                app.interaction.?.deinit();
+                app.interaction = null;
+            }
             current_app = &app;
             objc.msgSend(void, application, objc.sel("activateIgnoringOtherApps:"), .{true});
             updateHoverFromMouse(&app);
@@ -217,7 +203,7 @@ fn captureBaselines(app: *App) !void {
             return error.CaptureFailed;
         };
         defer objc.CGImageRelease(image);
-        display.baseline = try canvasFromImage(app.allocator, image, objc.interpolation_none);
+        display.baseline = try canvasFromImage(app.allocator, image);
         const baseline = display.baseline.?;
         if (display.logical.w > 0) {
             display.scale = @as(f64, @floatFromInt(baseline.width)) / display.logical.w;
@@ -243,11 +229,7 @@ fn printInfo(app: *App) void {
     }
 }
 
-fn canvasFromImage(
-    allocator: std.mem.Allocator,
-    image: objc.CGImageRef,
-    quality: c_int,
-) !Canvas {
+fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !Canvas {
     const width = objc.CGImageGetWidth(image);
     const height = objc.CGImageGetHeight(image);
     if (width == 0 or height == 0) return error.EmptyImage;
@@ -268,7 +250,7 @@ fn canvasFromImage(
     ) orelse return error.NoContext;
     defer objc.CGContextRelease(context);
 
-    objc.CGContextSetInterpolationQuality(context, quality);
+    objc.CGContextSetInterpolationQuality(context, objc.interpolation_none);
     objc.CGContextDrawImage(context, objc.CGRect.make(0, 0, @floatFromInt(width), @floatFromInt(height)), image);
     return canvas;
 }
@@ -282,7 +264,21 @@ fn startOverlay(app: *App) !void {
     const window_class = windowClass();
     if (view_class == null or window_class == null) return error.ClassRegistrationFailed;
 
-    app.sample = try Canvas.init(app.allocator, magnifier.sample_side, magnifier.sample_side);
+    const surfaces = try app.allocator.alloc(interaction_mod.Surface, app.displays.items.len);
+    defer app.allocator.free(surfaces);
+    for (app.displays.items, 0..) |display, index| {
+        display.interaction_id = index;
+        surfaces[index] = .{
+            .logical = display.logical,
+            .scale = display.scale,
+            .baseline = &display.baseline.?,
+        };
+    }
+    app.interaction = try interaction_mod.Interaction.init(app.allocator, surfaces);
+    errdefer {
+        app.interaction.?.deinit();
+        app.interaction = null;
+    }
     for (app.displays.items) |display| {
         try createWindow(app, display, view_class, window_class);
     }
@@ -341,9 +337,6 @@ fn hideOverlays(app: *App) void {
             objc.msgSend(void, window, objc.sel("orderOut:"), .{@as(id, null)});
         }
     }
-    app.loupe_active = false;
-    app.loupe_display = null;
-    app.loupe_origin = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,27 +345,12 @@ fn hideOverlays(app: *App) void {
 
 /// Compose a region into a display's canvas and mark it for redraw.
 fn paintRegion(display: *Display, region: Rect) void {
-    const app = display.app;
     const canvas = &(display.canvas orelse return);
     const clipped = region.clamped(canvas.width, canvas.height);
     if (clipped.isEmpty()) return;
 
-    canvas.setClip(clipped);
-    const scene = overlay_mod.Scene{
-        .baseline = &(display.baseline orelse return),
-        .selection = selectionPhysical(display),
-        .cursor = cursorPhysical(display),
-        .ui_scale = display.scale,
-    };
-    overlay_mod.renderRegion(canvas, scene, clipped);
-    if (app.loupe_active and app.loupe_display == display) {
-        if (app.loupe_origin) |origin| {
-            if (app.sample) |sample| {
-                overlay_mod.renderMagnifier(canvas, origin, sample, display.scale);
-            }
-        }
-    }
-    canvas.clearClip();
+    const interaction = &(display.app.interaction orelse return);
+    interaction.render(display.interaction_id, canvas, clipped);
 
     // View coordinates are points and y up.
     const points = objc.CGRect.make(
@@ -384,33 +362,6 @@ fn paintRegion(display: *Display, region: Rect) void {
     if (display.view) |view| {
         objc.msgSend(void, view, objc.sel("setNeedsDisplayInRect:"), .{points});
     }
-}
-
-fn selectionPhysical(display: *Display) ?Rect {
-    const selection = display.app.selection orelse return null;
-    return rectPhysical(display, selection);
-}
-
-fn rectPhysical(display: *Display, selection: FRect) ?Rect {
-    const local = FRect{
-        .x = selection.x - display.logical.x,
-        .y = selection.y - display.logical.y,
-        .w = selection.w,
-        .h = selection.h,
-    };
-    const physical = Rect.roundF(.{
-        .x = local.x * display.scale,
-        .y = local.y * display.scale,
-        .w = local.w * display.scale,
-        .h = local.h * display.scale,
-    });
-    if (physical.isEmpty()) return null;
-    return physical;
-}
-
-fn cursorPhysical(display: *Display) ?Point {
-    if (display.app.cursor_display != display) return null;
-    return display.toPhysical(display.app.cursor_local);
 }
 
 fn displayForView(view: id) ?*Display {
@@ -425,132 +376,33 @@ fn displayForView(view: id) ?*Display {
 // Gesture
 // ---------------------------------------------------------------------------
 
+fn repaintDamages(app: *App, damages: []const interaction_mod.Damage) void {
+    for (damages) |damage| paintRegion(app.displays.items[damage.surface], damage.rect);
+}
+
 fn updateCursor(app: *App, display: *Display, local: Point) void {
-    app.cursor_display = display;
-    app.cursor_local = local;
-    app.cursor_global = .{ .x = display.logical.x + local.x, .y = display.logical.y + local.y };
-
-    if (app.coordinator.isSelecting()) {
-        // Drive the state machine on every move, otherwise the selection stays
-        // the zero sized rectangle `begin` created and no box is ever drawn.
-        _ = app.coordinator.move(app.cursor_global);
-        updateSelection(app);
-    } else {
-        updateLoupe(app);
-    }
-}
-
-fn updateLoupe(app: *App) void {
-    const display = app.cursor_display orelse return;
-    var sample = app.sample orelse return;
-    const baseline = &(display.baseline orelse return);
-
-    sampling.fillSample(&sample, baseline, display.scale, app.cursor_local);
-    const rgb = magnifier.hexAt(sample) orelse return;
-
-    const physical = display.toPhysical(app.cursor_local);
-    const origin = magnifier.windowOrigin(physical, display.scale);
-
-    const previous_display = app.loupe_display;
-    const previous_origin = app.loupe_origin;
-    if (app.loupe_active and previous_display == display and previous_origin != null) {
-        const old = previous_origin.?;
-        if (std.meta.eql(app.last_sample_hex, rgb) and
-            @abs(old.x - origin.x) < 0.5 and @abs(old.y - origin.y) < 0.5)
-        {
-            return;
-        }
-    }
-
-    app.last_sample_hex = rgb;
-    app.loupe_display = display;
-    app.loupe_origin = origin;
-    app.loupe_active = true;
-
-    var damage = magnifier.windowRect(origin, display.scale).expand(2);
-    if (previous_origin) |old| {
-        damage = damage.unionWith(magnifier.windowRect(old, display.scale).expand(2));
-    }
-    if (previous_display) |old_display| {
-        if (old_display != display) {
-            if (previous_origin) |old| {
-                paintRegion(old_display, magnifier.windowRect(old, old_display.scale).expand(2));
-            }
-        }
-    }
-    paintRegion(display, damage);
-}
-
-fn hideLoupe(app: *App) void {
-    if (!app.loupe_active) return;
-    app.loupe_active = false;
-    app.last_sample_hex = null;
-    if (app.loupe_display) |display| {
-        if (app.loupe_origin) |origin| {
-            paintRegion(display, magnifier.windowRect(origin, display.scale).expand(2));
-        }
-    }
-    app.loupe_display = null;
-    app.loupe_origin = null;
-}
-
-fn updateSelection(app: *App) void {
-    const next = app.coordinator.selection;
-    const previous = app.selection;
-    app.selection = next;
-
-    for (app.displays.items) |display| {
-        var damage = Rect{};
-        if (previous) |rect| {
-            if (rectPhysical(display, rect)) |physical| damage = damage.unionWith(physical);
-        }
-        if (next) |rect| {
-            if (rectPhysical(display, rect)) |physical| damage = damage.unionWith(physical);
-        }
-        // The size badge is drawn beside the cursor, outside the selection, so it
-        // has to be damaged explicitly or it is composed nowhere.
-        if (display.last_badge) |previous_badge| damage = damage.unionWith(previous_badge);
-        display.last_badge = null;
-        if (next) |rect| {
-            if (rectPhysical(display, rect)) |physical| {
-                if (cursorPhysical(display)) |cursor| {
-                    const canvas_rect = if (display.canvas) |canvas| canvas.rect() else Rect{};
-                    if (overlay_mod.sizeBadge(physical, cursor, display.scale, canvas_rect)) |badge| {
-                        damage = damage.unionWith(badge.rect.expand(2));
-                        display.last_badge = badge.rect;
-                    }
-                }
-            }
-        }
-        if (!damage.isEmpty()) paintRegion(display, damage.expand(3));
-    }
+    const damages = app.interaction.?.moveCursor(display.interaction_id, local);
+    repaintDamages(app, damages);
 }
 
 fn beginSelection(app: *App) void {
-    _ = app.coordinator.begin(app.cursor_global);
-    app.selection = app.coordinator.selection;
-    updateSelection(app);
+    const damages = app.interaction.?.beginSelection();
+    repaintDamages(app, damages);
 }
 
 fn endSelection(app: *App) void {
-    const event = app.coordinator.end(app.cursor_global);
-    app.selection = app.coordinator.selection;
-    switch (event) {
-        .finished => |result| finish(app, result),
-        else => {},
-    }
+    if (app.interaction.?.endSelection()) |result| finish(app, result);
 }
 
 fn cancel(app: *App) void {
-    if (app.finished) return;
+    if (app.finished or !app.interaction.?.cancel()) return;
     app.finished = true;
     terminate();
 }
 
-fn finish(app: *App, result: gesture.Result) void {
+fn finish(app: *App, result: interaction_mod.Result) void {
     if (app.finished) return;
     app.finished = true;
-    hideLoupe(app);
 
     switch (result) {
         .color => |point| {
@@ -613,16 +465,16 @@ fn captureScreenshot(app: *App, rect: FRect) !Canvas {
     var single: ?*Display = null;
     var count: usize = 0;
     for (app.displays.items) |display| {
-        if (intersectionOf(display, rect) == null) continue;
+        if (rect.intersection(display.logical).isEmpty()) continue;
         single = display;
         count += 1;
     }
     if (count == 1) {
         const display = single.?;
-        const intersection = intersectionOf(display, rect).?;
+        const intersection = rect.intersection(display.logical);
         const image = try captureDisplayRegion(display, intersection);
         defer objc.CGImageRelease(image);
-        return canvasFromImage(app.allocator, image, objc.interpolation_none);
+        return canvasFromImage(app.allocator, image);
     }
 
     var scale: f64 = 1;
@@ -631,13 +483,15 @@ fn captureScreenshot(app: *App, rect: FRect) !Canvas {
     const width: u32 = @intFromFloat(@max(1, @round(rect.w * scale)));
     const height: u32 = @intFromFloat(@max(1, @round(rect.h * scale)));
     var composite = try Canvas.init(app.allocator, width, height);
+    errdefer composite.deinit();
 
     for (app.displays.items) |display| {
-        const intersection = intersectionOf(display, rect) orelse continue;
+        const intersection = rect.intersection(display.logical);
+        if (intersection.isEmpty()) continue;
         const image = try captureDisplayRegion(display, intersection);
         defer objc.CGImageRelease(image);
 
-        var captured = try canvasFromImage(app.allocator, image, objc.interpolation_high);
+        var captured = try canvasFromImage(app.allocator, image);
         const destination = Rect.roundF(.{
             .x = (intersection.x - rect.x) * scale,
             .y = (intersection.y - rect.y) * scale,
@@ -648,18 +502,6 @@ fn captureScreenshot(app: *App, rect: FRect) !Canvas {
         captured.deinit();
     }
     return composite;
-}
-
-/// The part of `rect` that lands on `display`, in global logical coordinates.
-fn intersectionOf(display: *Display, rect: FRect) ?FRect {
-    const intersection = FRect{
-        .x = @max(rect.x, display.logical.x),
-        .y = @max(rect.y, display.logical.y),
-        .w = @min(rect.maxX(), display.logical.maxX()) - @max(rect.x, display.logical.x),
-        .h = @min(rect.maxY(), display.logical.maxY()) - @max(rect.y, display.logical.y),
-    };
-    if (intersection.isEmpty()) return null;
-    return intersection;
 }
 
 fn captureDisplayRegion(display: *Display, intersection: FRect) !objc.CGImageRef {
@@ -736,16 +578,16 @@ fn copyPng(bytes: []const u8) void {
 fn viewClass() objc.Class {
     const Methods = struct {
         const list = [_]objc.Method{
-            .{ .name = "drawRect:", .imp = @ptrCast(&viewDrawRect) },
-            .{ .name = "acceptsFirstResponder", .imp = @ptrCast(&viewAcceptsFirstResponder) },
-            .{ .name = "acceptsFirstMouse:", .imp = @ptrCast(&viewAcceptsFirstMouse) },
-            .{ .name = "mouseMoved:", .imp = @ptrCast(&viewMouseMoved) },
-            .{ .name = "mouseDown:", .imp = @ptrCast(&viewMouseDown) },
-            .{ .name = "mouseDragged:", .imp = @ptrCast(&viewMouseDragged) },
-            .{ .name = "mouseUp:", .imp = @ptrCast(&viewMouseUp) },
-            .{ .name = "rightMouseDown:", .imp = @ptrCast(&viewRightMouseDown) },
-            .{ .name = "keyDown:", .imp = @ptrCast(&viewKeyDown) },
-            .{ .name = "resetCursorRects", .imp = @ptrCast(&viewResetCursorRects) },
+            .{ .name = "drawRect:", .imp = @ptrCast(&viewDrawRect), .types = "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
+            .{ .name = "acceptsFirstResponder", .imp = @ptrCast(&viewAcceptsFirstResponder), .types = objc.bool_no_args },
+            .{ .name = "acceptsFirstMouse:", .imp = @ptrCast(&viewAcceptsFirstMouse), .types = objc.bool_object_arg },
+            .{ .name = "mouseMoved:", .imp = @ptrCast(&viewMouseMoved), .types = "v@:@" },
+            .{ .name = "mouseDown:", .imp = @ptrCast(&viewMouseDown), .types = "v@:@" },
+            .{ .name = "mouseDragged:", .imp = @ptrCast(&viewMouseDragged), .types = "v@:@" },
+            .{ .name = "mouseUp:", .imp = @ptrCast(&viewMouseUp), .types = "v@:@" },
+            .{ .name = "rightMouseDown:", .imp = @ptrCast(&viewRightMouseDown), .types = "v@:@" },
+            .{ .name = "keyDown:", .imp = @ptrCast(&viewKeyDown), .types = "v@:@" },
+            .{ .name = "resetCursorRects", .imp = @ptrCast(&viewResetCursorRects), .types = "v@:" },
         };
     };
     const Cache = struct {
@@ -760,8 +602,8 @@ fn viewClass() objc.Class {
 fn windowClass() objc.Class {
     const Methods = struct {
         const list = [_]objc.Method{
-            .{ .name = "canBecomeKeyWindow", .imp = @ptrCast(&windowCanBecomeKey) },
-            .{ .name = "canBecomeMainWindow", .imp = @ptrCast(&windowCanBecomeMain) },
+            .{ .name = "canBecomeKeyWindow", .imp = @ptrCast(&windowCanBecomeKey), .types = objc.bool_no_args },
+            .{ .name = "canBecomeMainWindow", .imp = @ptrCast(&windowCanBecomeMain), .types = objc.bool_no_args },
         };
     };
     const Cache = struct {
@@ -775,7 +617,6 @@ fn windowClass() objc.Class {
 
 fn viewDrawRect(self: id, cmd: SEL, rect: objc.CGRect) callconv(.c) void {
     _ = cmd;
-    _ = rect; // AppKit only calls us for the dirty region and clips to it.
     const display = displayForView(self) orelse return;
     const canvas = display.canvas orelse return;
 
@@ -786,6 +627,7 @@ fn viewDrawRect(self: id, cmd: SEL, rect: objc.CGRect) callconv(.c) void {
     if (graphics_context == null) return;
     const context = objc.msgSend(?*anyopaque, graphics_context, objc.sel("CGContext"), .{}) orelse return;
     const bounds = objc.msgSend(objc.CGRect, self, objc.sel("bounds"), .{});
+    objc.CGContextClipToRect(@ptrCast(context), rect);
     objc.CGContextSetInterpolationQuality(@ptrCast(context), objc.interpolation_none);
     objc.CGContextDrawImage(@ptrCast(context), bounds, image);
 }
@@ -886,7 +728,6 @@ fn viewMouseDown(self: id, cmd: SEL, event: id) callconv(.c) void {
     const display = displayForView(self) orelse return;
     app.buttons += 1;
     updateCursor(app, display, viewPoint(self, display, event));
-    hideLoupe(app);
     beginSelection(app);
 }
 
@@ -903,7 +744,7 @@ fn viewMouseUp(self: id, cmd: SEL, event: id) callconv(.c) void {
     const display = displayForView(self) orelse return;
     if (app.buttons > 0) app.buttons -= 1;
     updateCursor(app, display, viewPoint(self, display, event));
-    if (app.coordinator.isSelecting()) endSelection(app);
+    if (app.interaction.?.isSelecting()) endSelection(app);
 }
 
 fn viewRightMouseDown(self: id, cmd: SEL, event: id) callconv(.c) void {

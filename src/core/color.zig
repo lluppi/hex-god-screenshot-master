@@ -31,19 +31,10 @@ pub fn rgbOf(pixel: u32) Rgb {
     };
 }
 
-pub fn alphaOf(pixel: u32) u8 {
-    return @intCast((pixel >> 24) & 0xff);
-}
-
 /// Black at the given opacity, premultiplied (the only translucent colour the
 /// badges need).
 pub fn black(alpha: u8) u32 {
     return @as(u32, alpha) << 24;
-}
-
-pub fn white(alpha: u8) u32 {
-    const a: u32 = alpha;
-    return (a << 24) | (a << 16) | (a << 8) | a;
 }
 
 /// Scale a premultiplied pixel's alpha (and therefore its components) by a

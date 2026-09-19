@@ -42,6 +42,15 @@ pub const FRect = struct {
         return self.w <= 0 or self.h <= 0;
     }
 
+    pub fn intersection(self: FRect, other: FRect) FRect {
+        const x0 = @max(self.x, other.x);
+        const y0 = @max(self.y, other.y);
+        const x1 = @min(self.maxX(), other.maxX());
+        const y1 = @min(self.maxY(), other.maxY());
+        if (x1 <= x0 or y1 <= y0) return .{};
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    }
+
     /// Normalised rectangle from two corner points, in any order.
     pub fn between(a: Point, b: Point) FRect {
         return .{
@@ -50,10 +59,6 @@ pub const FRect = struct {
             .w = @abs(b.x - a.x),
             .h = @abs(b.y - a.y),
         };
-    }
-
-    pub fn contains(self: FRect, p: Point) bool {
-        return p.x >= self.x and p.x < self.maxX() and p.y >= self.y and p.y < self.maxY();
     }
 };
 
@@ -110,10 +115,6 @@ pub const Rect = struct {
 
     pub fn expand(self: Rect, amount: i32) Rect {
         return self.inset(-amount, -amount);
-    }
-
-    pub fn translate(self: Rect, dx: i32, dy: i32) Rect {
-        return .{ .x = self.x + dx, .y = self.y + dy, .w = self.w, .h = self.h };
     }
 
     pub fn contains(self: Rect, x: i32, y: i32) bool {

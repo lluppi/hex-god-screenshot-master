@@ -92,4 +92,3 @@ WL_PRIVATE const struct wl_interface zwlr_layer_surface_v1_interface = {
 	10, zwlr_layer_surface_v1_requests,
 	2, zwlr_layer_surface_v1_events,
 };
-

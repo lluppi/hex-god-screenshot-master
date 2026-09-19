@@ -21,14 +21,10 @@ const Rect = geom.Rect;
 const FRect = geom.FRect;
 
 pub const Error = error{
-    NoScreencopy,
     CaptureFailed,
+    OutOfMemory,
     UnsupportedFormat,
     Timeout,
-    OutOfMemory,
-    TooLarge,
-    CreatePoolFailed,
-    CreateBufferFailed,
     Disconnected,
 };
 
@@ -36,7 +32,6 @@ const FrameReader = struct {
     shm: *wl.Obj,
     shm_version: u32,
     buffer: shm.ShmBuffer = .{},
-    have_buffer: bool = false,
     state: enum { pending, ready, failed } = .pending,
 };
 
@@ -73,11 +68,10 @@ fn onBuffer(
     stride: u32,
 ) callconv(.c) void {
     const self = reader(data);
-    self.buffer.create(self.shm, self.shm_version, width, height, format, stride) catch {
+    self.buffer.createUntracked(self.shm, self.shm_version, width, height, format, stride) catch {
         self.state = .failed;
         return;
     };
-    self.have_buffer = true;
     wl.screencopyFrameCopy(frame.?, self.buffer.buffer.?);
 }
 
@@ -102,7 +96,7 @@ fn onFailed(data: ?*anyopaque, frame: ?*wl.Obj) callconv(.c) void {
 
 /// Ask for one region of one output and block until the pixels have landed.
 /// `region` is output-local logical coordinates. The returned buffer is the
-/// caller's to destroy and still has its listener pointing at itself.
+/// caller's to destroy.
 pub fn captureRegion(
     display: *wl.Obj,
     manager: *wl.Obj,
@@ -112,33 +106,7 @@ pub fn captureRegion(
     output: *wl.Obj,
     region: FRect,
 ) Error!shm.ShmBuffer {
-    const x: i32 = @intFromFloat(@floor(region.x));
-    const y: i32 = @intFromFloat(@floor(region.y));
-    const width: i32 = @max(1, @as(i32, @intFromFloat(@round(region.w))));
-    const height: i32 = @max(1, @as(i32, @intFromFloat(@round(region.h))));
-
-    var context = FrameReader{ .shm = shm_obj, .shm_version = shm_version };
-    const frame = wl.screencopyCaptureOutputRegion(
-        manager,
-        manager_version,
-        0,
-        output,
-        x,
-        y,
-        width,
-        height,
-    ) orelse return Error.CaptureFailed;
-    wl.addListener(frame, &frame_listener, @ptrCast(&context));
-    defer wl.screencopyFrameDestroy(frame);
-
-    var attempts: usize = 0;
-    while (context.state == .pending) {
-        attempts += 1;
-        if (attempts > 400) return Error.Timeout;
-        wl.pump(display, 250) catch return Error.Disconnected;
-    }
-    if (context.state == .failed) return Error.CaptureFailed;
-    return context.buffer;
+    return capture(display, manager, manager_version, shm_obj, shm_version, output, region);
 }
 
 /// Same, for a whole output.
@@ -150,11 +118,38 @@ pub fn captureOutput(
     shm_version: u32,
     output: *wl.Obj,
 ) Error!shm.ShmBuffer {
+    return capture(display, manager, manager_version, shm_obj, shm_version, output, null);
+}
+
+fn capture(
+    display: *wl.Obj,
+    manager: *wl.Obj,
+    manager_version: u32,
+    shm_obj: *wl.Obj,
+    shm_version: u32,
+    output: *wl.Obj,
+    region: ?FRect,
+) Error!shm.ShmBuffer {
     var context = FrameReader{ .shm = shm_obj, .shm_version = shm_version };
-    const frame = wl.screencopyCaptureOutput(manager, manager_version, 0, output) orelse
-        return Error.CaptureFailed;
-    wl.addListener(frame, &frame_listener, @ptrCast(&context));
-    defer wl.screencopyFrameDestroy(frame);
+    const frame = if (region) |requested| blk: {
+        const x: i32 = @intFromFloat(@floor(requested.x));
+        const y: i32 = @intFromFloat(@floor(requested.y));
+        const width: i32 = @max(1, @as(i32, @intFromFloat(@round(requested.w))));
+        const height: i32 = @max(1, @as(i32, @intFromFloat(@round(requested.h))));
+        break :blk wl.screencopyCaptureOutputRegion(
+            manager,
+            manager_version,
+            0,
+            output,
+            x,
+            y,
+            width,
+            height,
+        );
+    } else wl.screencopyCaptureOutput(manager, manager_version, 0, output);
+    const requested_frame = frame orelse return Error.CaptureFailed;
+    wl.addListener(requested_frame, &frame_listener, @ptrCast(&context));
+    defer wl.screencopyFrameDestroy(requested_frame);
 
     var attempts: usize = 0;
     while (context.state == .pending) {
@@ -169,8 +164,8 @@ pub fn captureOutput(
 /// Copy a captured shm buffer into a canvas, normalising the compositor's
 /// pixel format and honouring a stride that is not tightly packed.
 pub fn toCanvas(allocator: std.mem.Allocator, captured: *shm.ShmBuffer) Error!Canvas {
-    const canvas = try Canvas.init(allocator, captured.width, captured.height);
-    errdefer allocator.free(canvas.pixels);
+    var canvas = try Canvas.init(allocator, captured.width, captured.height);
+    errdefer canvas.deinit();
 
     const bytes = captured.memory.?;
     var y: u32 = 0;

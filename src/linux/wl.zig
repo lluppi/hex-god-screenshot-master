@@ -95,17 +95,12 @@ pub const seat_capability_pointer: u32 = 1;
 pub const seat_capability_keyboard: u32 = 2;
 pub const keyboard_keymap_format_xkb_v1: u32 = 1;
 
-pub const layer_background: u32 = 0;
 pub const layer_overlay: u32 = 2;
 
 pub const anchor_top: u32 = 1;
-pub const anchor_bottom: u32 = 2;
 pub const anchor_left: u32 = 4;
-pub const anchor_right: u32 = 8;
 
-pub const keyboard_interactivity_none: u32 = 0;
 pub const keyboard_interactivity_exclusive: u32 = 1;
-pub const keyboard_interactivity_on_demand: u32 = 2;
 
 pub fn fixedToFloat(value: i32) f64 {
     return @as(f64, @floatFromInt(value)) / 256.0;

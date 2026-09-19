@@ -76,4 +76,3 @@ WL_PRIVATE const struct wl_interface zxdg_output_v1_interface = {
 	1, zxdg_output_v1_requests,
 	5, zxdg_output_v1_events,
 };
-

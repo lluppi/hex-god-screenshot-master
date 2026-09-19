@@ -95,4 +95,3 @@ WL_PRIVATE const struct wl_interface zwlr_screencopy_frame_v1_interface = {
 	3, zwlr_screencopy_frame_v1_requests,
 	7, zwlr_screencopy_frame_v1_events,
 };
-

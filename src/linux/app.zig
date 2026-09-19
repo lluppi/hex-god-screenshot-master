@@ -20,9 +20,7 @@ const sampling = @import("../core/sampling.zig");
 const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
 const color_mod = @import("../core/color.zig");
-const gesture = @import("../core/gesture.zig");
-const magnifier = @import("../core/magnifier.zig");
-const overlay_mod = @import("../core/overlay.zig");
+const interaction_mod = @import("../core/interaction.zig");
 const png = @import("../core/png.zig");
 const out = @import("../core/out.zig");
 const cli = @import("../core/cli.zig");
@@ -101,6 +99,7 @@ const overlay_settle_ms: u64 = 60;
 const Output = struct {
     app: *App,
     wl_output: *wl.Obj,
+    interaction_id: interaction_mod.SurfaceId = 0,
     xdg_output: ?*wl.Obj = null,
     /// Global logical position and size, from xdg_output (or the mode size).
     logical: FRect = .{},
@@ -120,9 +119,6 @@ const Output = struct {
     dirty: [2]std.ArrayList(Rect) = .{ .empty, .empty },
     /// A buffer that has never been committed needs a full paint.
     fresh: [2]bool = .{ true, true },
-    /// Where the size badge was last drawn, so the next move can erase it. The
-    /// badge sits outside the selection rectangle, so it needs its own damage.
-    last_badge: ?Rect = null,
     surface: ?*wl.Obj = null,
     surface_version: u32 = 1,
     layer_surface: ?*wl.Obj = null,
@@ -171,22 +167,12 @@ pub const App = struct {
     data_device: ?*wl.Obj = null,
     outputs: std.ArrayList(*Output) = .empty,
 
-    // Gesture.
-    coordinator: gesture.Coordinator = .{},
+    // Native pointer routing plus shared gesture/loupe state.
     cursor_output: ?*Output = null,
-    cursor_local: Point = .{},
-    cursor_global: Point = .{},
-    selection: ?FRect = null,
+    interaction: ?interaction_mod.Interaction = null,
     buttons: u32 = 0,
     pointer_serial: u32 = 0,
     last_serial: u32 = 0,
-
-    // Loupe.
-    loupe_output: ?*Output = null,
-    loupe_origin: ?Point = null,
-    loupe_active: bool = false,
-    sample: ?Canvas = null,
-    last_sample_hex: ?color_mod.Rgb = null,
 
     // Clipboard.
     clip_source: ?*wl.Obj = null,
@@ -256,6 +242,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
 
     var app = App{ .allocator = allocator, .display = display };
     defer wl.wl_display_disconnect(display);
+    defer if (app.clip_source) |source| wl.dataSourceDestroy(source);
 
     try connect(&app);
     try captureBaselines(&app);
@@ -345,6 +332,10 @@ fn connect(self: *App) !void {
             wl.addListener(xdg, &xdg_output_listener, o);
         }
         try roundtrip(self);
+        for (self.outputs.items) |o| {
+            if (o.xdg_output) |xdg| wl.xdgOutputDestroy(xdg);
+            o.xdg_output = null;
+        }
     }
 
     // A pointer and a keyboard exist only once the seat advertises them.
@@ -415,7 +406,21 @@ fn startOverlay(self: *App) !void {
         return error.MissingProtocols;
     }
 
-    self.sample = try Canvas.init(self.allocator, magnifier.sample_side, magnifier.sample_side);
+    const surfaces = try self.allocator.alloc(interaction_mod.Surface, self.outputs.items.len);
+    defer self.allocator.free(surfaces);
+    for (self.outputs.items, 0..) |o, index| {
+        o.interaction_id = index;
+        surfaces[index] = .{
+            .logical = o.logical,
+            .scale = o.scale,
+            .baseline = &o.baseline.?,
+        };
+    }
+    self.interaction = try interaction_mod.Interaction.init(self.allocator, surfaces);
+    errdefer {
+        self.interaction.?.deinit();
+        self.interaction = null;
+    }
     try createCursor(self);
 
     for (self.outputs.items) |o| {
@@ -500,7 +505,6 @@ fn teardownOverlay(self: *App) void {
         }
         o.have_buffers = false;
         o.fresh = .{ true, true };
-        o.last_badge = null;
         for (&o.dirty) |*dirty| dirty.clearRetainingCapacity();
     }
     if (self.cursor_surface) |surface| {
@@ -511,7 +515,11 @@ fn teardownOverlay(self: *App) void {
         buffer.destroy();
         self.cursor_buffer = null;
     }
-    self.loupe_active = false;
+    if (self.interaction) |*interaction| {
+        interaction.deinit();
+        self.interaction = null;
+    }
+    self.cursor_output = null;
     self.overlays_up = false;
 }
 
@@ -566,25 +574,31 @@ fn flushOutput(o: *Output) void {
     var regions: [MAX_DIRTY]Rect = undefined;
     var count: usize = 0;
     if (o.fresh[index]) {
-        compose(o, &canvas, canvas.rect());
         regions[0] = canvas.rect();
         count = 1;
         o.fresh[index] = false;
     } else {
         const pending = o.dirty[index].items;
         if (pending.len == 0) return;
-        for (pending, 0..) |region, i| {
-            if (i >= MAX_DIRTY) break;
-            compose(o, &canvas, region);
-            regions[i] = region;
-            count = i + 1;
+        for (pending) |region| {
+            if (count < MAX_DIRTY) {
+                regions[count] = region;
+                count += 1;
+            } else {
+                regions[MAX_DIRTY - 1] = regions[MAX_DIRTY - 1].unionWith(region);
+            }
         }
     }
     o.dirty[index].clearRetainingCapacity();
 
+    for (regions[0..count]) |region| compose(o, &canvas, region);
+
     wl.surfaceAttach(o.surface.?, buffer.buffer.?, 0, 0);
-    var i: usize = 0;
-    while (i < count) : (i += 1) damageBuffer(o, regions[i]);
+    if (o.surface_version >= 4) {
+        for (regions[0..count]) |region| damageBuffer(o, region);
+    } else {
+        damageBuffer(o, regions[0]);
+    }
     wl.surfaceCommit(o.surface.?);
     buffer.released = false;
     o.buffer_index = 1 - index;
@@ -604,7 +618,7 @@ fn damageBuffer(o: *Output, region: Rect) void {
         };
         _ = wl.request(o.surface.?, 9, &args); // wl_surface.damage_buffer
     } else {
-        // Fall back to damage in surface coordinates: the whole thing.
+        // Fall back to one full-surface damage call per commit.
         wl.surfaceDamage(
             o.surface.?,
             0,
@@ -617,172 +631,41 @@ fn damageBuffer(o: *Output, region: Rect) void {
 
 /// Paint one region of one output from the baseline plus the current gesture.
 fn compose(o: *Output, canvas: *Canvas, region: Rect) void {
-    const app = o.app;
-    const scene = overlay_mod.Scene{
-        .baseline = &o.baseline.?,
-        .selection = selectionPhysicalOf(o, o.app.selection),
-        .cursor = cursorPhysical(o),
-        .ui_scale = o.scale,
-    };
-    overlay_mod.renderRegion(canvas, scene, region);
-    if (app.loupe_active and app.loupe_output == o) {
-        if (app.loupe_origin) |origin| {
-            if (app.sample) |sample| overlay_mod.renderMagnifier(canvas, origin, sample, o.scale);
-        }
-    }
-}
-
-/// Cursor position in this output's physical pixels, when the pointer is here.
-fn cursorPhysical(o: *Output) ?Point {
-    if (o.app.cursor_output != o) return null;
-    return o.toPhysical(o.app.cursor_local);
+    const interaction = &(o.app.interaction orelse return);
+    interaction.render(o.interaction_id, canvas, region);
 }
 
 // ---------------------------------------------------------------------------
 // Gesture
 // ---------------------------------------------------------------------------
 
+fn repaintDamages(self: *App, damages: []const interaction_mod.Damage) void {
+    for (damages) |damage| {
+        repaintOutput(self, self.outputs.items[damage.surface], damage.rect);
+    }
+}
+
 fn updateCursor(self: *App, o: *Output, local: Point) void {
+    const interaction = &(self.interaction orelse return);
     self.cursor_output = o;
-    self.cursor_local = local;
-    self.cursor_global = .{ .x = o.logical.x + local.x, .y = o.logical.y + local.y };
-
-    if (self.coordinator.isSelecting()) {
-        // Drive the state machine on every move, otherwise the selection stays
-        // the zero sized rectangle `begin` created and no box is ever drawn.
-        _ = self.coordinator.move(self.cursor_global);
-        updateSelection(self);
-    } else {
-        updateLoupe(self);
-    }
-}
-
-fn updateLoupe(self: *App) void {
-    const o = self.cursor_output orelse return;
-    var sample = self.sample orelse return;
-    const baseline = &(o.baseline orelse return);
-
-    sampling.fillSample(&sample, baseline, o.scale, self.cursor_local);
-    const rgb = magnifier.hexAt(sample) orelse return;
-
-    const physical = o.toPhysical(self.cursor_local);
-    const origin = magnifier.windowOrigin(physical, o.scale);
-
-    const previous_output = self.loupe_output;
-    const previous_origin = self.loupe_origin;
-    const same_spot = self.loupe_active and previous_output == o and
-        self.last_sample_hex != null and
-        std.meta.eql(self.last_sample_hex.?, rgb);
-    if (same_spot) {
-        if (previous_origin) |old| {
-            if (@abs(old.x - origin.x) < 0.5 and @abs(old.y - origin.y) < 0.5) return;
-        }
-    }
-
-    self.last_sample_hex = rgb;
-    self.loupe_output = o;
-    self.loupe_origin = origin;
-    self.loupe_active = true;
-
-    var damage = magnifier.windowRect(origin, o.scale).expand(2);
-    if (previous_output) |old_output| {
-        if (previous_origin) |old| {
-            damage = damage.unionWith(magnifier.windowRect(old, old_output.scale).expand(2));
-        }
-    }
-    // If the pointer moved to another output, erase the loupe there too.
-    if (previous_output) |old_output| {
-        if (old_output != o and previous_origin != null) {
-            repaintOutput(self, old_output, magnifier.windowRect(previous_origin.?, old_output.scale).expand(2));
-        }
-    }
-    repaintOutput(self, o, damage);
-}
-
-fn hideLoupe(self: *App) void {
-    if (!self.loupe_active) return;
-    self.loupe_active = false;
-    self.last_sample_hex = null;
-    if (self.loupe_output) |o| {
-        if (self.loupe_origin) |origin| {
-            repaintOutput(self, o, magnifier.windowRect(origin, o.scale).expand(2));
-        }
-    }
-    self.loupe_output = null;
-    self.loupe_origin = null;
-}
-
-fn updateSelection(self: *App) void {
-    const next = self.coordinator.selection;
-    const previous = self.selection;
-    self.selection = next;
-
-    for (self.outputs.items) |o| {
-        var damage = Rect{};
-        if (previous) |rect| {
-            if (selectionPhysicalOf(o, rect)) |physical| damage = damage.unionWith(physical);
-        }
-        if (next) |rect| {
-            if (selectionPhysicalOf(o, rect)) |physical| damage = damage.unionWith(physical);
-        }
-        // The size badge is drawn beside the cursor, outside the selection, so it
-        // has to be damaged explicitly or it is composed nowhere.
-        if (o.last_badge) |previous_badge| damage = damage.unionWith(previous_badge);
-        o.last_badge = null;
-        if (next) |rect| {
-            if (selectionPhysicalOf(o, rect)) |physical| {
-                if (cursorPhysical(o)) |cursor| {
-                    if (overlay_mod.sizeBadge(physical, cursor, o.scale, o.canvasSize())) |badge| {
-                        damage = damage.unionWith(badge.rect.expand(2));
-                        o.last_badge = badge.rect;
-                    }
-                }
-            }
-        }
-        if (!damage.isEmpty()) repaintOutput(self, o, damage.expand(3));
-    }
-}
-
-/// A global logical selection converted to this output's physical pixels, or
-/// null when it misses this output entirely.
-fn selectionPhysicalOf(o: *Output, selection: ?FRect) ?Rect {
-    const selection_rect = selection orelse return null;
-    const local = FRect{
-        .x = selection_rect.x - o.logical.x,
-        .y = selection_rect.y - o.logical.y,
-        .w = selection_rect.w,
-        .h = selection_rect.h,
-    };
-    const physical = Rect.roundF(.{
-        .x = local.x * o.scale,
-        .y = local.y * o.scale,
-        .w = local.w * o.scale,
-        .h = local.h * o.scale,
-    });
-    if (physical.isEmpty()) return null;
-    const canvas = o.canvasSize();
-    if (!physical.intersects(.{ .x = 0, .y = 0, .w = canvas.w, .h = canvas.h })) return null;
-    return physical;
+    const damages = interaction.moveCursor(o.interaction_id, local);
+    repaintDamages(self, damages);
 }
 
 fn beginSelection(self: *App) void {
-    _ = self.coordinator.begin(self.cursor_global);
-    self.selection = self.coordinator.selection;
-    updateSelection(self);
+    const interaction = &(self.interaction orelse return);
+    const damages = interaction.beginSelection();
+    repaintDamages(self, damages);
 }
 
 fn endSelection(self: *App) void {
-    const event = self.coordinator.end(self.cursor_global);
-    self.selection = self.coordinator.selection;
-    switch (event) {
-        .finished => |result| finish(self, result),
-        else => {},
-    }
+    const interaction = &(self.interaction orelse return);
+    if (interaction.endSelection()) |result| finish(self, result);
 }
 
 fn cancel(self: *App) void {
-    if (self.coordinator.finished) return;
-    self.coordinator.finished = true;
+    const interaction = &(self.interaction orelse return);
+    if (!interaction.cancel()) return;
     teardownOverlay(self);
     self.quit = true;
 }
@@ -805,7 +688,6 @@ fn devMoveCursor(self: *App, global: Point) void {
 fn devClick(self: *App, point: Point) void {
     devMoveCursor(self, point);
     if (self.cursor_output == null) return;
-    hideLoupe(self);
     beginSelection(self);
     endSelection(self);
 }
@@ -818,7 +700,6 @@ fn devClick(self: *App, point: Point) void {
 fn devDrag(self: *App, start: Point, via: ?Point, end: Point, hold_ms: u64) void {
     devMoveCursor(self, start);
     if (self.cursor_output == null) return;
-    hideLoupe(self);
     beginSelection(self);
     if (via) |mid| {
         devMoveCursor(self, mid);
@@ -840,8 +721,7 @@ fn holdWithPump(self: *App, milliseconds: u64) void {
     }
 }
 
-fn finish(self: *App, result: gesture.Result) void {
-    hideLoupe(self);
+fn finish(self: *App, result: interaction_mod.Result) void {
     switch (result) {
         .color => |point| {
             const rgb = pickColor(self, point) orelse {
@@ -908,13 +788,13 @@ fn captureScreenshot(self: *App, rect: FRect) !Canvas {
     var single: ?*Output = null;
     var count: usize = 0;
     for (self.outputs.items) |o| {
-        if (intersectionOf(o, rect) == null) continue;
+        if (rect.intersection(o.logical).isEmpty()) continue;
         single = o;
         count += 1;
     }
     if (count == 1) {
         const o = single.?;
-        const intersection = intersectionOf(o, rect).?;
+        const intersection = rect.intersection(o.logical);
         var captured = try captureRegionOf(self, o, intersection);
         defer captured.destroy();
         return capture.toCanvas(self.allocator, &captured);
@@ -926,10 +806,11 @@ fn captureScreenshot(self: *App, rect: FRect) !Canvas {
     const width: u32 = @intFromFloat(@max(1, @round(rect.w * scale)));
     const height: u32 = @intFromFloat(@max(1, @round(rect.h * scale)));
     var output_canvas = try Canvas.init(self.allocator, width, height);
-    errdefer self.allocator.free(output_canvas.pixels);
+    errdefer output_canvas.deinit();
 
     for (self.outputs.items) |o| {
-        const intersection = intersectionOf(o, rect) orelse continue;
+        const intersection = rect.intersection(o.logical);
+        if (intersection.isEmpty()) continue;
         var captured = try captureRegionOf(self, o, intersection);
         defer captured.destroy();
 
@@ -944,18 +825,6 @@ fn captureScreenshot(self: *App, rect: FRect) !Canvas {
         image.deinit();
     }
     return output_canvas;
-}
-
-/// The part of `rect` that lands on `o`, in global logical coordinates.
-fn intersectionOf(o: *Output, rect: FRect) ?FRect {
-    const intersection = FRect{
-        .x = @max(rect.x, o.logical.x),
-        .y = @max(rect.y, o.logical.y),
-        .w = @min(rect.maxX(), o.logical.maxX()) - @max(rect.x, o.logical.x),
-        .h = @min(rect.maxY(), o.logical.maxY()) - @max(rect.y, o.logical.y),
-    };
-    if (intersection.isEmpty()) return null;
-    return intersection;
 }
 
 fn captureRegionOf(self: *App, o: *Output, intersection: FRect) !shm_mod.ShmBuffer {
@@ -1360,7 +1229,10 @@ fn onPointerLeave(
     app.last_serial = serial;
     const o = outputForSurface(app, surface) orelse return;
     if (app.cursor_output == o) app.cursor_output = null;
-    hideLoupe(app);
+    if (app.interaction) |*interaction| {
+        const damages = interaction.leaveSurface(o.interaction_id);
+        repaintDamages(app, damages);
+    }
 }
 
 fn onPointerMotion(
@@ -1396,16 +1268,14 @@ fn onPointerButton(
     if (state == wl.button_pressed) {
         app.buttons += 1;
         if (button == btn_left) {
-            if (app.cursor_output != null) {
-                hideLoupe(app);
-                beginSelection(app);
-            }
+            if (app.cursor_output != null) beginSelection(app);
         } else if (button == btn_right) {
             cancel(app);
         }
     } else if (state == wl.button_released) {
         if (app.buttons > 0) app.buttons -= 1;
-        if (button == btn_left and app.coordinator.isSelecting()) endSelection(app);
+        const selecting = if (app.interaction) |*interaction| interaction.isSelecting() else false;
+        if (button == btn_left and selecting) endSelection(app);
     }
 }
 
@@ -1520,8 +1390,9 @@ fn onDataSourceSend(
 }
 
 fn onDataSourceCancelled(data: ?*anyopaque, source: ?*wl.Obj) callconv(.c) void {
-    _ = source;
     const app: *App = @ptrCast(@alignCast(data.?));
+    if (source) |cancelled| wl.dataSourceDestroy(cancelled);
+    app.clip_source = null;
     app.clip_cancelled = true;
 }
 

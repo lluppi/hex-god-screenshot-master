@@ -82,10 +82,12 @@ src/
 ├── main.zig              # platform dispatch
 ├── core/                 # everything shared, no platform APIs
 │   ├── gesture.zig       # click vs drag state machine (4px threshold)
+│   ├── interaction.zig   # shared cursor, loupe, selection and damage policy
 │   ├── canvas.zig        # ARGB8888 drawing surface, clipped writes
 │   ├── color.zig         # #RRGGBB, premultiplied compositing, dimming
 │   ├── magnifier.zig     # the loupe: 21x21 sample, grid, target, hex badge
 │   ├── overlay.zig       # baseline + dim + selection + size badge compositor
+│   ├── badge.zig         # shared rounded text badge geometry and painting
 │   ├── font.zig          # anti-aliased bitmap text from font_data.zig
 │   ├── sampling.zig      # pixel under the cursor, loupe sample extraction
 │   ├── png.zig           # PNG encoder (std.compress.flate for the zlib stream)
@@ -244,14 +246,6 @@ zig build-obj src/main.zig -target x86_64-macos  -fno-emit-bin
 
 - Wayland protocol glue: `protocol/README.md`
 - Bitmap font: `python3 tools/gen-font.py > src/core/font_data.zig`
-
-`zig build preview` also takes `--scale N`, which renders the overlay at a display
-scale other than 1 so fractional-scale behaviour (loupe metrics, the ring, glyph
-filtering) can be checked without a compositor that scales:
-
-```sh
-zig build preview -- --scale 1.25
-```
 
 ## Status
 

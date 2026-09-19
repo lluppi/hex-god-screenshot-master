@@ -13,6 +13,7 @@ pub const Canvas = struct {
     height: u32,
     pixels: []u32,
     allocator: std.mem.Allocator,
+    owns_pixels: bool = true,
     /// When set, every write is confined to this rectangle. The overlay
     /// renderer recomposes the screen one dirty rectangle at a time and must
     /// never touch a pixel outside the region it is about to damage, otherwise
@@ -31,7 +32,7 @@ pub const Canvas = struct {
     }
 
     pub fn deinit(self: *Canvas) void {
-        self.allocator.free(self.pixels);
+        if (self.owns_pixels) self.allocator.free(self.pixels);
         self.* = undefined;
     }
 
@@ -189,30 +190,9 @@ pub const Canvas = struct {
         self.blend(x, y, scaled);
     }
 
-    /// Filled anti-aliased circle. Coverage comes from the analytic distance to
-    /// the edge ramped across one pixel, which is both cheaper and smoother than
-    /// supersampling the whole disc.
-    pub fn fillCircleAA(self: *Canvas, center_x: f64, center_y: f64, radius: f64, pixel: u32) void {
-        const x0: i32 = @intFromFloat(@floor(center_x - radius - 1));
-        const x1: i32 = @intFromFloat(@ceil(center_x + radius + 1));
-        const y0: i32 = @intFromFloat(@floor(center_y - radius - 1));
-        const y1: i32 = @intFromFloat(@ceil(center_y + radius + 1));
-        var y = y0;
-        while (y <= y1) : (y += 1) {
-            var x = x0;
-            while (x <= x1) : (x += 1) {
-                const dx = @as(f64, @floatFromInt(x)) + 0.5 - center_x;
-                const dy = @as(f64, @floatFromInt(y)) + 0.5 - center_y;
-                const d = @sqrt(dx * dx + dy * dy);
-                self.blendCoverage(x, y, pixel, std.math.clamp(radius - d + 0.5, 0, 1));
-            }
-        }
-    }
-
     /// Anti-aliased circle outline. The coverage of a pixel in an annulus is the
     /// coverage of the outer disc times how far past the inner edge it is, which
-    /// softens both boundaries and still degenerates to `fillCircleAA` when the
-    /// thickness swallows the inner radius.
+    /// softens both boundaries when the thickness leaves an inner radius.
     pub fn strokeCircleAA(
         self: *Canvas,
         center_x: f64,

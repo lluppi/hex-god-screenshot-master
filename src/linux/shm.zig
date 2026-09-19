@@ -37,10 +37,38 @@ pub const ShmBuffer = struct {
             .height = self.height,
             .pixels = pixels,
             .allocator = std.heap.page_allocator,
+            .owns_pixels = false,
         };
     }
 
     pub fn create(
+        self: *ShmBuffer,
+        shm: *wl.Obj,
+        shm_version: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+    ) !void {
+        try self.init(shm, shm_version, width, height, format, stride);
+        self.relocate();
+    }
+
+    /// Create a buffer whose release state is not observed. Capture buffers use
+    /// this because they are returned by value and destroyed immediately.
+    pub fn createUntracked(
+        self: *ShmBuffer,
+        shm: *wl.Obj,
+        shm_version: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+    ) !void {
+        try self.init(shm, shm_version, width, height, format, stride);
+    }
+
+    fn init(
         self: *ShmBuffer,
         shm: *wl.Obj,
         shm_version: u32,
@@ -89,7 +117,6 @@ pub const ShmBuffer = struct {
             .format = format,
             .released = true,
         };
-        self.relocate();
     }
 
     /// Point the buffer's event listener at this struct's address again. Must be
