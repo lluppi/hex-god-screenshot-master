@@ -168,26 +168,36 @@ the readout occupied last frame as well as the one it occupies now.
 
 Nothing in the overlay is drawn with a hard binary edge:
 
+- **The loupe disc** is composited in a single pass: the body, the magnified
+  sample, the cell grid and the centre target are stacked per pixel, and only
+  then is that pixel blended with the circle's coverage. Order matters here. The
+  first attempt drew the body anti-aliased and then stamped the sample over it
+  with a hard circular clip, which throws the anti-aliased edge away again - the
+  ring was soft but the disc boundary was not. Doing it in one pass also means
+  the grid is clipped by the same coverage test, so it cannot escape the circle
+  into the corners of the bounding square.
+- **The ring** is deliberately thicker than the original hairline. A ~1px curve
+  has no pixel area to anti-alias, so it reads as a stair-stepped line however
+  good the coverage maths is. It is 2pt of white with a 1pt dark separator just
+  inside, so it reads against light and dark content alike.
 - **Circles** use analytic coverage: the distance from the pixel centre to the
-  edge is ramped across one pixel, so the loupe body and its ring soften in both
-  directions. A ring's coverage is the outer disc's coverage times how far past
-  the inner edge the pixel is.
+  edge is ramped across one pixel. A ring's coverage is the outer disc's
+  coverage times how far past the inner edge the pixel is.
 - **Rounded rectangles** (the badges) compute each row's edges as exact
   positions and blend the boundary pixels by the fraction of themselves inside.
-- **Text** is the important one. The glyphs are baked by `tools/gen-font.py` at
-  `supersample` times the size they are drawn at (4x: a 32x56 ink mask per 8x14
-  cell) and drawing box filters that mask down, weighing every sample by how much
-  of the destination pixel it covers. Scaling a 1x ink mask with nearest
-  neighbour - what this did first - gives each stroke a different width whenever
-  the scale is not a whole number, which is exactly what "jagged text" looks
-  like. On the live 1.25x display the badge text goes from 9 distinct luminance
-  levels to 137.
+- **Text** is baked by `tools/gen-font.py` at `supersample` times the size it is
+  drawn at (4x: a 32x56 ink mask per 8x14 cell) and drawing box filters that mask
+  down, weighing every sample by how much of the destination pixel it covers.
+  Scaling a 1x ink mask with nearest neighbour - what this did first - gives each
+  stroke a different width whenever the scale is not a whole number, which is
+  exactly what "jagged text" looks like. On the live 1.25x display the badge text
+  goes from 9 distinct luminance levels to 137.
 
 The magnified sample itself stays nearest-neighbour on purpose: the loupe is a
 pixel inspector, so its pixels must be the real screen pixels.
 
-Axis-aligned 1px lines (the selection border, the loupe's pixel grid and target
-square) are left hard, which is what keeps them crisp.
+Axis-aligned 1px lines (the selection border and the loupe's target square) are
+left hard, which is what keeps them crisp.
 
 ## Develop
 
@@ -267,13 +277,28 @@ checked against `grim` and `wl-paste` on the same screen:
 - the loupe's magnify maths is verified pixel-exactly (5288/5288 sampled pixels)
   by `zig build preview`, which needs no compositor, and still is after the
   anti-aliasing work - the magnified sample is deliberately untouched by it.
-- anti-aliasing is measured against the previous build on the same drag: the
-  badge text goes from 9 distinct luminance levels to 137 in the live screenshot,
-  the glyph strokes go from single-width `@` blocks with the stem jumping columns
-  to a graded curve, and the ring's luminance along its circumference smooths to
-  half the mean step size (10.97 -> 5.57) with the fully white pixels dropping
-  from 1801 to 1145 as edges become partial coverage. Text still decodes to
-  `625×500 px` (1748/1800, the misses being pixels sitting on the 50% threshold).
+- anti-aliasing is measured against the previous build rendering the same scene,
+  via `zig build preview -- --scale 1.25`, which is the same renderer both
+  frontends call:
+  - pixels the loupe paints outside its own disc (the grid bleeding into the
+    bounding square's corners): **586 -> 0**.
+  - angles around the ring whose edge has no intermediate pixel at all, i.e. a
+    hard step: **561/720 -> 0/720**.
+  - badge text distinct luminance levels in a live screenshot: **9 -> 137**, and
+    the glyph strokes go from single-width `@` blocks with the stem jumping
+    columns to a graded curve.
+  - the ring's own luminance along its circumference halves its mean step
+    (10.97 -> 5.57) with fully-white pixels dropping 1801 -> 1145 as edges become
+    partial coverage.
+  - text still decodes to `625×500 px` (1748/1800, the misses being pixels
+    sitting on the 50% threshold), and the magnified sample is untouched at
+    5092/5092 pixel-exact inside r<51 (outside that is the dark separator ring,
+    which is decoration, not sample).
+
+  A live before/after of the grid bleed could not be measured on this box: the
+  wallpaper animates, so almost no pixel is identical across two captures, and
+  staged static backdrops kept being covered by other windows. The preview
+  number is the stronger measurement anyway, being exact and repeatable.
 - the click path copies the right colour: `--dev-click 900,300` prints `#656B75`,
   puts `#656B75` on the clipboard and `grim -g "900,300 1x1"` agrees.
 - the drag path draws its box and its size readout: photographed mid gesture,
