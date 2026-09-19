@@ -21,6 +21,9 @@ pub const ShmBuffer = struct {
     height: u32 = 0,
     stride: u32 = 0,
     format: u32 = 0,
+    /// Set when the compositor says it is done with this buffer. Informational:
+    /// frame pacing is done with `wl_surface.frame` (see linux/app.zig), because
+    /// a compositor may hold the buffer it is displaying indefinitely.
     released: bool = true,
 
     /// A drawing view over the mapped memory. Only valid when `stride` is

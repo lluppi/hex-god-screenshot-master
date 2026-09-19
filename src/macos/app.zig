@@ -428,6 +428,9 @@ fn updateCursor(app: *App, display: *Display, local: Point) void {
     app.cursor_global = .{ .x = display.logical.x + local.x, .y = display.logical.y + local.y };
 
     if (app.coordinator.isSelecting()) {
+        // Drive the state machine on every move, otherwise the selection stays
+        // the zero sized rectangle `begin` created and no box is ever drawn.
+        _ = app.coordinator.move(app.cursor_global);
         updateSelection(app);
     } else {
         updateLoupe(app);

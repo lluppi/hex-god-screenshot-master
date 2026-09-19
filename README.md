@@ -135,8 +135,21 @@ two frontends behaviourally identical.
 On Wayland the clipboard lives in the client that owns the selection, so after
 copying, the process keeps serving the `wl_data_source` until another client
 takes the selection (or a minute passes, or a paste has been idle for five
-seconds). On macOS the pasteboard is server side and the process exits straight
-away.
+seconds). The payload is copied into the process's own memory first, since it
+outlives the call that produced it. On macOS the pasteboard is server side and
+the process exits straight away.
+
+### Frame pacing
+
+Each output has two `wl_shm` buffers and they are alternated on every commit. A
+buffer the compositor has handed back with `wl_buffer.release` is preferred, but
+the client never *waits* for one, and it never waits for a `wl_surface.frame`
+callback either: Hyprland holds the buffer it is currently displaying until a
+newer one arrives and does not always deliver frame callbacks for layer
+surfaces, so a client that insists on either stops painting after a frame or two.
+A repaint requested while both buffers look busy is composed anyway; the worst
+case is one frame landing in a buffer the compositor is still reading, which is
+invisible in practice for a full screen dim.
 
 ## Develop
 
@@ -149,6 +162,19 @@ zig build preview         # render the overlay + loupe to zig-out/preview.png
 `zig build preview` needs no compositor: it draws the shared overlay renderer
 over a synthetic screen so the loupe, selection, dim and badges can be inspected
 without booting a session. Handy when changing anything in `src/core`.
+
+`--dev-click X,Y` and `--dev-drag X,Y,W,H` drive a synthetic gesture through the
+same functions the pointer handlers call, so the two paths that need a mouse can
+be exercised (and photographed, with `--dev-hold MS`) from a script. They are a
+development aid for exactly the code that cannot be reached otherwise:
+
+```sh
+# what a click copies
+hex-god-screenshot-master --dev-click 900,300 && wl-paste
+# photograph the selection box mid drag
+hex-god-screenshot-master --dev-drag 600,400,400,300 --dev-hold 4000 &
+sleep 1.5 && grim /tmp/box.png
+```
 
 Type-check a frontend for the other platform without an SDK or a toolchain:
 
@@ -185,10 +211,25 @@ checked against `grim` and `wl-paste` on the same screen:
   correctly.
 - the loupe's magnify maths is verified pixel-exactly (5288/5288 sampled pixels)
   by `zig build preview`, which needs no compositor.
+- the click path copies the right colour: `--dev-click 900,300` prints `#656B75`,
+  puts `#656B75` on the clipboard and `grim -g "900,300 1x1"` agrees.
+- the drag path draws its box: photographed mid gesture with `--dev-drag
+  600,400,400,300 --dev-hold 4000`, all four edges are a white 1-2px line at the
+  selection, every sampled interior pixel is undimmed against a pre-overlay
+  grab, every sampled exterior pixel is dimmed, and the size badge is drawn next
+  to the cursor. The screenshot that lands on the clipboard is 500x375 for that
+  logical 400x300 selection, and matches a `grim` grab of the same region.
 
-Not exercised here: Escape and right-click cancel (no way to inject input
-without another client), the drag interaction end to end (same reason), and
+Not exercised here: Escape and right-click cancel (no way to inject keys or
+buttons without another client on this box - the keyboard is grabbed exclusively
+while the overlay is up, so this is the one path that needs a human), and
 multi-output layouts, as this machine has one display.
+
+Three bugs found by exercising the two paths above, all fixed: the selection was
+never grown out of the zero sized rectangle `begin` creates (so no box was ever
+drawn, on either frontend), the clipboard payload pointed at the stack frame of
+the function that produced it (so a click copied garbage), and commits were
+gated on `wl_buffer.release`, which stalls forever on Hyprland.
 
 ### macOS
 

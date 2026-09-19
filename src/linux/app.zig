@@ -38,6 +38,56 @@ const namespace = "hex-god-screenshot-master";
 const btn_left: u32 = 0x110;
 const btn_right: u32 = 0x111;
 
+/// Synthetic gestures for development: they drive the very same functions the
+/// pointer handlers call, so a click or a drag can be exercised (and screenshoted
+/// mid selection) without a mouse or an input injector on the box.
+const DevGesture = union(enum) {
+    none,
+    click: Point,
+    drag: struct { start: Point, end: Point, hold_ms: u64 },
+};
+
+fn parseDevGesture(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    remaining: *std.ArrayList([]const u8),
+) !DevGesture {
+    var click: ?Point = null;
+    var drag: ?[4]f64 = null;
+    var hold_ms: u64 = 1000;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--dev-click")) {
+            index += 1;
+            if (index >= args.len) return error.MissingPoint;
+            click = cli.parsePoint(args[index]) orelse return error.MissingPoint;
+        } else if (std.mem.eql(u8, arg, "--dev-drag")) {
+            index += 1;
+            if (index >= args.len) return error.MissingRect;
+            const rect = cli.parseRect(args[index]) orelse return error.MissingRect;
+            drag = .{ rect.x, rect.y, rect.maxX(), rect.maxY() };
+        } else if (std.mem.eql(u8, arg, "--dev-hold")) {
+            index += 1;
+            if (index >= args.len) return error.MissingRect;
+            hold_ms = std.fmt.parseInt(u64, args[index], 10) catch return error.MissingRect;
+        } else {
+            try remaining.append(allocator, arg);
+        }
+    }
+
+    if (drag) |values| {
+        return .{ .drag = .{
+            .start = .{ .x = values[0], .y = values[1] },
+            .end = .{ .x = values[2], .y = values[3] },
+            .hold_ms = hold_ms,
+        } };
+    }
+    if (click) |point| return .{ .click = point };
+    return .none;
+}
+
 const clipboard_timeout_ms: i64 = 60_000;
 const clipboard_idle_after_send_ms: i64 = 5_000;
 const overlay_settle_ms: u64 = 60;
@@ -58,6 +108,7 @@ const Output = struct {
     baseline: ?Canvas = null,
     buffers: [2]shm_mod.ShmBuffer = .{ .{}, .{} },
     have_buffers: bool = false,
+    /// Which buffer the next commit uses; the two are alternated.
     buffer_index: usize = 0,
     /// Per-buffer regions that still need composing (output-local physical).
     dirty: [2]std.ArrayList(Rect) = .{ .empty, .empty },
@@ -160,8 +211,13 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
     var args = try minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // argv[0]
+    var raw: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |arg| raw.append(allocator, arg) catch return error.OutOfMemory;
     var rest: std.ArrayList([]const u8) = .empty;
-    while (args.next()) |arg| rest.append(allocator, arg) catch return error.OutOfMemory;
+    const dev_gesture = parseDevGesture(allocator, raw.items, &rest) catch {
+        out.fail("--dev-click needs X,Y; --dev-drag needs X,Y,X2,Y2; --dev-hold needs ms\n", .{});
+        std.process.exit(2);
+    };
 
     const options = switch (cli.parse(rest.items)) {
         .options => |parsed| parsed,
@@ -222,6 +278,11 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
         },
         .interactive => {
             try startOverlay(&app);
+            switch (dev_gesture) {
+                .none => try eventLoop(&app),
+                .click => |point| devClick(&app, point),
+                .drag => |drag| devDrag(&app, drag.start, drag.end, drag.hold_ms),
+            }
             try eventLoop(&app);
             teardownOverlay(&app);
         },
@@ -454,37 +515,60 @@ fn repaintOutput(self: *App, o: *Output, region: Rect) void {
     flushOutput(o);
 }
 
-/// Compose and commit the next free buffer, if one is free.
+fn flushAll(self: *App) void {
+    for (self.outputs.items) |o| flushOutput(o);
+}
+
+/// Compose the pending regions into a buffer and commit it.
+///
+/// A released buffer is preferred, but never waited for. Hyprland can hold the
+/// buffer it is displaying for a long time, so gating on `wl_buffer.release` (or
+/// on a `wl_surface.frame` callback, which it also stops delivering for these
+/// surfaces) means the client waits forever and stops painting - that is how the
+/// selection box went missing. Alternating regardless keeps frames flowing; the
+/// worst case is that a frame lands in a buffer the compositor is still reading.
 fn flushOutput(o: *Output) void {
     if (!o.configured or !o.have_buffers) return;
-    const index = o.buffer_index;
+
+    const other = 1 - o.buffer_index;
+    const index = if (o.buffers[o.buffer_index].released) o.buffer_index else other;
     const buffer = &o.buffers[index];
-    if (!buffer.released) return;
 
     var canvas = buffer.canvas();
     canvas.clearClip();
 
+    var regions: [MAX_DIRTY]Rect = undefined;
+    var count: usize = 0;
     if (o.fresh[index]) {
         compose(o, &canvas, canvas.rect());
-        attachAndDamage(o, canvas.rect());
+        regions[0] = canvas.rect();
+        count = 1;
         o.fresh[index] = false;
-    } else if (o.dirty[index].items.len > 0) {
-        for (o.dirty[index].items) |region| {
-            compose(o, &canvas, region);
-            attachAndDamage(o, region);
-        }
     } else {
-        return;
+        const pending = o.dirty[index].items;
+        if (pending.len == 0) return;
+        for (pending, 0..) |region, i| {
+            if (i >= MAX_DIRTY) break;
+            compose(o, &canvas, region);
+            regions[i] = region;
+            count = i + 1;
+        }
     }
     o.dirty[index].clearRetainingCapacity();
 
     wl.surfaceAttach(o.surface.?, buffer.buffer.?, 0, 0);
+    var i: usize = 0;
+    while (i < count) : (i += 1) damageBuffer(o, regions[i]);
     wl.surfaceCommit(o.surface.?);
     buffer.released = false;
     o.buffer_index = 1 - index;
 }
 
-fn attachAndDamage(o: *Output, region: Rect) void {
+/// Upper bound on regions composed in one commit; anything past it is folded
+/// into the last rectangle so no region is silently dropped.
+const MAX_DIRTY = 32;
+
+fn damageBuffer(o: *Output, region: Rect) void {
     if (o.surface_version >= 4) {
         const args = [_]wl.Argument{
             .{ .i = region.x },
@@ -538,6 +622,9 @@ fn updateCursor(self: *App, o: *Output, local: Point) void {
     self.cursor_global = .{ .x = o.logical.x + local.x, .y = o.logical.y + local.y };
 
     if (self.coordinator.isSelecting()) {
+        // Drive the state machine on every move, otherwise the selection stays
+        // the zero sized rectangle `begin` created and no box is ever drawn.
+        _ = self.coordinator.move(self.cursor_global);
         updateSelection(self);
     } else {
         updateLoupe(self);
@@ -658,6 +745,52 @@ fn cancel(self: *App) void {
     self.coordinator.finished = true;
     teardownOverlay(self);
     self.quit = true;
+}
+
+/// Move the synthetic cursor to a global logical point, resolving which output
+/// it lands on. Only used by the dev gestures.
+fn devMoveCursor(self: *App, global: Point) void {
+    for (self.outputs.items) |o| {
+        const local = o.localLogical(global);
+        if (local.x < 0 or local.y < 0) continue;
+        if (local.x >= o.logical.w or local.y >= o.logical.h) continue;
+        updateCursor(self, o, local);
+        return;
+    }
+    out.fail("no output contains {d},{d}\n", .{ global.x, global.y });
+}
+
+/// Exactly what a press-and-release in place does: a click that resolves to a
+/// colour.
+fn devClick(self: *App, point: Point) void {
+    devMoveCursor(self, point);
+    if (self.cursor_output == null) return;
+    hideLoupe(self);
+    beginSelection(self);
+    endSelection(self);
+}
+
+/// Exactly what a press, drag and release does, with a pause before the release
+/// so the selection box can be photographed mid gesture. The pause pumps the
+/// event loop, because a commit is only sent to the compositor on the next
+/// flush: without that the box would sit in our outgoing buffer and never be
+/// seen on screen.
+fn devDrag(self: *App, start: Point, end: Point, hold_ms: u64) void {
+    devMoveCursor(self, start);
+    if (self.cursor_output == null) return;
+    hideLoupe(self);
+    beginSelection(self);
+    devMoveCursor(self, end);
+    holdWithPump(self, hold_ms);
+    endSelection(self);
+}
+
+fn holdWithPump(self: *App, milliseconds: u64) void {
+    var remaining = milliseconds;
+    while (remaining > 0) : (remaining -= @min(remaining, 20)) {
+        wl.pump(self.display, 20) catch return;
+        flushAll(self);
+    }
 }
 
 fn finish(self: *App, result: gesture.Result) void {
@@ -821,13 +954,19 @@ fn serveClipboard(self: *App, mime: [:0]const u8, payload: []const u8) void {
         self.quit = true;
         return;
     };
+    // The payload outlives the caller's stack frame: this process keeps serving
+    // the selection until the paste happens, so it has to own the bytes.
+    const owned = self.allocator.dupe(u8, payload) catch {
+        self.quit = true;
+        return;
+    };
     wl.addListener(source, &data_source_listener, self);
     wl.dataSourceOffer(source, mime.ptr);
     wl.dataDeviceSetSelection(device, source, self.last_serial);
     _ = wl.wl_display_flush(self.display);
 
     self.clip_source = source;
-    self.clip_payload = payload;
+    self.clip_payload = owned;
     self.clip_set_ms = nowMs();
     self.clip_last_send_ms = null;
     self.clip_cancelled = false;
@@ -851,13 +990,16 @@ fn nowMs() i64 {
 // ---------------------------------------------------------------------------
 
 fn eventLoop(self: *App) !void {
-    var iterations: usize = 0;
     while (!self.quit) {
-        iterations += 1;
         wl.pump(self.display, 40) catch {
             self.quit = true;
             return;
         };
+        // A repaint requested while both buffers were still being read by the
+        // compositor is dropped by flushOutput; this retries it as soon as one
+        // comes back. Without it a dropped frame - a selection box included -
+        // would sit in the dirty list until the next pointer event.
+        flushAll(self);
         if (self.pending_screenshot) |rect| {
             self.pending_screenshot = null;
             finishScreenshot(self, rect);
