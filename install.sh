@@ -15,8 +15,8 @@ echo "Run it with:"
 echo "  $EXECUTABLE"
 echo
 if [[ ":$PATH:" != *":$PREFIX/bin:"* ]]; then
-    echo "Add this to your shell config if needed:"
-    echo "  export PATH=\"$PREFIX/bin:\$PATH\""
-    echo
+	echo "Add this to your shell config if needed:"
+	echo "  export PATH=\"$PREFIX/bin:\$PATH\""
+	echo
 fi
 echo "For a compositor keybind, point it straight at $PREFIX/bin/$EXECUTABLE."

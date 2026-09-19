@@ -17,13 +17,13 @@ zig build -Doptimize=ReleaseFast
 # Screen Recording permission is tied to the app's code requirement, so sign
 # with a stable local identity rather than ad-hoc.
 if ! security find-identity -v -p codesigning | grep -Fq "\"$SIGNING_IDENTITY\""; then
-    scripts/setup-local-signing.sh >/dev/null
+	scripts/setup-local-signing.sh >/dev/null
 fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "zig-out/bin/$EXECUTABLE" "$APP/Contents/MacOS/$EXECUTABLE"
-cat > "$APP/Contents/Info.plist" <<PLIST
+cat >"$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -55,7 +55,7 @@ PLIST
 codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP"
 
 mkdir -p "$(dirname "$LAUNCHER")"
-printf '#!/bin/sh\nexec open -a %q --args "$@"\n' "$APP" > "$LAUNCHER"
+printf '#!/bin/sh\nexec open -a %q --args "$@"\n' "$APP" >"$LAUNCHER"
 chmod +x "$LAUNCHER"
 
 echo "Installed: $APP"
@@ -66,7 +66,7 @@ echo "System Settings > Privacy & Security > Screen & System Audio Recording,"
 echo "then run it again."
 echo
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    echo "Add this to your shell config if needed:"
-    echo '  export PATH="$HOME/.local/bin:$PATH"'
-    echo
+	echo "Add this to your shell config if needed:"
+	echo '  export PATH="$HOME/.local/bin:$PATH"'
+	echo
 fi

@@ -27,7 +27,7 @@ pub const ShmBuffer = struct {
     /// exactly `width * 4`, which is what `create` guarantees for our own
     /// buffers; capture buffers are read row by row instead.
     pub fn canvas(self: *ShmBuffer) Canvas {
-        const bytes = self.memory.?[0..@as(usize, self.stride) * self.height];
+        const bytes = self.memory.?[0 .. @as(usize, self.stride) * self.height];
         const pixels: []u32 = @alignCast(std.mem.bytesAsSlice(u32, bytes));
         return .{
             .width = self.width,
