@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .root_module = preview_module,
     });
     const preview_cmd = b.addRunArtifact(preview);
+    if (b.args) |args| preview_cmd.addArgs(args);
     const preview_step = b.step("preview", "render the overlay to zig-out/preview.png");
     preview_step.dependOn(&preview_cmd.step);
 }

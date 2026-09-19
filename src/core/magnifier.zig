@@ -68,7 +68,7 @@ pub fn render(canvas: *Canvas, origin: geom.Point, sample: Canvas, ui_scale: f64
     const centre_x = @as(f64, @floatFromInt(window.x)) + cursor_inset * ui_scale;
     const centre_y = @as(f64, @floatFromInt(window.y)) + cursor_inset * ui_scale;
 
-    canvas.fillCircle(centre_x, centre_y, ringRadius(ui_scale), color.solid(.{ .r = 0x1e, .g = 0x1e, .b = 0x1e }));
+    canvas.fillCircleAA(centre_x, centre_y, ringRadius(ui_scale), color.solid(.{ .r = 0x1e, .g = 0x1e, .b = 0x1e }));
     drawSample(canvas, window, sample, ui_scale);
     drawGrid(canvas, window, ui_scale);
     drawTarget(canvas, window, ui_scale);
@@ -134,8 +134,8 @@ fn drawTarget(canvas: *Canvas, window: Rect, ui_scale: f64) void {
 
 fn drawRing(canvas: *Canvas, centre_x: f64, centre_y: f64, ui_scale: f64) void {
     const radius = ringRadius(ui_scale);
-    canvas.strokeCircle(centre_x, centre_y, radius, 1.25 * ui_scale, color.solid(.{ .r = 255, .g = 255, .b = 255 }));
-    canvas.strokeCircle(centre_x, centre_y, radius - ui_scale, ui_scale, color.black(184));
+    canvas.strokeCircleAA(centre_x, centre_y, radius, 1.25 * ui_scale, color.solid(.{ .r = 255, .g = 255, .b = 255 }));
+    canvas.strokeCircleAA(centre_x, centre_y, radius - ui_scale, ui_scale, color.black(184));
 }
 
 fn drawHexBadge(canvas: *Canvas, window: Rect, sample: Canvas, ui_scale: f64) void {

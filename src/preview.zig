@@ -17,6 +17,20 @@ const png = @import("core/png.zig");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
+    // Optional `--scale N`: render at a display scale other than 1 so fractional
+    // scale behaviour (the loupe metrics, the ring, the glyph filtering) can be
+    // inspected without a compositor that scales.
+    var ui_scale: f64 = 1;
+    var args = try init.minimal.args.iterateAllocator(allocator);
+    defer args.deinit();
+    _ = args.next();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--scale")) {
+            const value = args.next() orelse return error.MissingScale;
+            ui_scale = std.fmt.parseFloat(f64, value) catch return error.BadScale;
+        }
+    }
+
     const width: u32 = 900;
     const height: u32 = 620;
     var baseline = try canvas_mod.Canvas.init(allocator, width, height);
@@ -46,7 +60,6 @@ pub fn main(init: std.process.Init) !void {
     var frame = try canvas_mod.Canvas.init(allocator, width, height);
     defer frame.deinit();
 
-    const ui_scale: f64 = 1;
     const selection = geom.Rect{ .x = 300, .y = 240, .w = 260, .h = 180 };
     const cursor = geom.Point{ .x = 560, .y = 420 };
 

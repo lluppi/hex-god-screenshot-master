@@ -46,6 +46,22 @@ pub fn white(alpha: u8) u32 {
     return (a << 24) | (a << 16) | (a << 8) | a;
 }
 
+/// Scale a premultiplied pixel's alpha (and therefore its components) by a
+/// coverage fraction, for anti-aliased edges. Premultiplied means this needs no
+/// unpremultiply/repremultiply round trip: every channel, alpha included, is
+/// simply multiplied by the same factor.
+pub fn withCoverage(pixel: u32, coverage: f64) u32 {
+    if (coverage <= 0) return 0;
+    if (coverage >= 1) return pixel;
+    const a: u32 = (pixel >> 24) & 0xff;
+    const scaled: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(a)) * coverage));
+    if (scaled == 0) return 0;
+    const red = (((pixel >> 16) & 0xff) * scaled) / a;
+    const green = (((pixel >> 8) & 0xff) * scaled) / a;
+    const blue = ((pixel & 0xff) * scaled) / a;
+    return (scaled << 24) | (red << 16) | (green << 8) | blue;
+}
+
 /// `#RRGGBB`, uppercase, exactly like the mac app printed.
 pub fn hexString(rgb: Rgb) [7]u8 {
     var out: [7]u8 = undefined;

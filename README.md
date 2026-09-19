@@ -86,7 +86,7 @@ src/
 │   ├── color.zig         # #RRGGBB, premultiplied compositing, dimming
 │   ├── magnifier.zig     # the loupe: 21x21 sample, grid, target, hex badge
 │   ├── overlay.zig       # baseline + dim + selection + size badge compositor
-│   ├── font.zig          # bitmap text from font_data.zig
+│   ├── font.zig          # anti-aliased bitmap text from font_data.zig
 │   ├── sampling.zig      # pixel under the cursor, loupe sample extraction
 │   ├── png.zig           # PNG encoder (std.compress.flate for the zlib stream)
 │   ├── cli.zig           # flags
@@ -164,6 +164,31 @@ readout that follows the cursor. A repaint that forgets one leaves a stale pill
 on screen until the next pointer event, so `updateSelection` unions in the rect
 the readout occupied last frame as well as the one it occupies now.
 
+### Anti-aliasing
+
+Nothing in the overlay is drawn with a hard binary edge:
+
+- **Circles** use analytic coverage: the distance from the pixel centre to the
+  edge is ramped across one pixel, so the loupe body and its ring soften in both
+  directions. A ring's coverage is the outer disc's coverage times how far past
+  the inner edge the pixel is.
+- **Rounded rectangles** (the badges) compute each row's edges as exact
+  positions and blend the boundary pixels by the fraction of themselves inside.
+- **Text** is the important one. The glyphs are baked by `tools/gen-font.py` at
+  `supersample` times the size they are drawn at (4x: a 32x56 ink mask per 8x14
+  cell) and drawing box filters that mask down, weighing every sample by how much
+  of the destination pixel it covers. Scaling a 1x ink mask with nearest
+  neighbour - what this did first - gives each stroke a different width whenever
+  the scale is not a whole number, which is exactly what "jagged text" looks
+  like. On the live 1.25x display the badge text goes from 9 distinct luminance
+  levels to 137.
+
+The magnified sample itself stays nearest-neighbour on purpose: the loupe is a
+pixel inspector, so its pixels must be the real screen pixels.
+
+Axis-aligned 1px lines (the selection border, the loupe's pixel grid and target
+square) are left hard, which is what keeps them crisp.
+
 ## Develop
 
 ```sh
@@ -174,7 +199,13 @@ zig build preview         # render the overlay + loupe to zig-out/preview.png
 
 `zig build preview` needs no compositor: it draws the shared overlay renderer
 over a synthetic screen so the loupe, selection, dim and badges can be inspected
-without booting a session. Handy when changing anything in `src/core`.
+without booting a session. Handy when changing anything in `src/core`. It also
+takes `--scale N`, which renders at a display scale other than 1 so fractional
+scale behaviour can be checked without a compositor that scales:
+
+```sh
+zig build preview -- --scale 1.25
+```
 
 `--dev-click X,Y` and `--dev-drag X,Y,W,H` drive a synthetic gesture through the
 same functions the pointer handlers call, so the two paths that need a mouse can
@@ -204,6 +235,14 @@ zig build-obj src/main.zig -target x86_64-macos  -fno-emit-bin
 - Wayland protocol glue: `protocol/README.md`
 - Bitmap font: `python3 tools/gen-font.py > src/core/font_data.zig`
 
+`zig build preview` also takes `--scale N`, which renders the overlay at a display
+scale other than 1 so fractional-scale behaviour (loupe metrics, the ring, glyph
+filtering) can be checked without a compositor that scales:
+
+```sh
+zig build preview -- --scale 1.25
+```
+
 ## Status
 
 ### Linux / Wayland
@@ -226,7 +265,15 @@ checked against `grim` and `wl-paste` on the same screen:
   target square, and the undimmed selection plus its size badge composite
   correctly.
 - the loupe's magnify maths is verified pixel-exactly (5288/5288 sampled pixels)
-  by `zig build preview`, which needs no compositor.
+  by `zig build preview`, which needs no compositor, and still is after the
+  anti-aliasing work - the magnified sample is deliberately untouched by it.
+- anti-aliasing is measured against the previous build on the same drag: the
+  badge text goes from 9 distinct luminance levels to 137 in the live screenshot,
+  the glyph strokes go from single-width `@` blocks with the stem jumping columns
+  to a graded curve, and the ring's luminance along its circumference smooths to
+  half the mean step size (10.97 -> 5.57) with the fully white pixels dropping
+  from 1801 to 1145 as edges become partial coverage. Text still decodes to
+  `625×500 px` (1748/1800, the misses being pixels sitting on the 50% threshold).
 - the click path copies the right colour: `--dev-click 900,300` prints `#656B75`,
   puts `#656B75` on the clipboard and `grim -g "900,300 1x1"` agrees.
 - the drag path draws its box and its size readout: photographed mid gesture,

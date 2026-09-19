@@ -166,7 +166,7 @@ pub const Canvas = struct {
         }
     }
 
-    pub fn strokeRect(self: Canvas, area: Rect, thickness: i32, pixel: u32) void {
+    pub fn strokeRect(self: *Canvas, area: Rect, thickness: i32, pixel: u32) void {
         if (thickness <= 0) return;
         const r = area.clamped(self.width, self.height);
         if (r.isEmpty()) return;
@@ -176,27 +176,45 @@ pub const Canvas = struct {
         self.fillRect(.{ .x = r.maxX() - thickness, .y = r.y, .w = thickness, .h = r.h }, pixel);
     }
 
-    /// Filled circle, used for the loupe body and for the rounded badge corners.
-    pub fn fillCircle(self: Canvas, center_x: f64, center_y: f64, radius: f64, pixel: u32) void {
-        const x0: i32 = @intFromFloat(@floor(center_x - radius));
-        const x1: i32 = @intFromFloat(@ceil(center_x + radius));
-        const y0: i32 = @intFromFloat(@floor(center_y - radius));
-        const y1: i32 = @intFromFloat(@ceil(center_y + radius));
-        const r2 = radius * radius;
+    /// Blend `pixel` at a fraction of its own alpha. Every anti-aliased shape
+    /// goes through here.
+    pub fn blendCoverage(self: *Canvas, x: i32, y: i32, pixel: u32, coverage: f64) void {
+        if (coverage <= 0) return;
+        if (coverage >= 1) {
+            self.blend(x, y, pixel);
+            return;
+        }
+        const scaled = color.withCoverage(pixel, coverage);
+        if (scaled == 0) return;
+        self.blend(x, y, scaled);
+    }
+
+    /// Filled anti-aliased circle. Coverage comes from the analytic distance to
+    /// the edge ramped across one pixel, which is both cheaper and smoother than
+    /// supersampling the whole disc.
+    pub fn fillCircleAA(self: *Canvas, center_x: f64, center_y: f64, radius: f64, pixel: u32) void {
+        const x0: i32 = @intFromFloat(@floor(center_x - radius - 1));
+        const x1: i32 = @intFromFloat(@ceil(center_x + radius + 1));
+        const y0: i32 = @intFromFloat(@floor(center_y - radius - 1));
+        const y1: i32 = @intFromFloat(@ceil(center_y + radius + 1));
         var y = y0;
         while (y <= y1) : (y += 1) {
             var x = x0;
             while (x <= x1) : (x += 1) {
                 const dx = @as(f64, @floatFromInt(x)) + 0.5 - center_x;
                 const dy = @as(f64, @floatFromInt(y)) + 0.5 - center_y;
-                if (dx * dx + dy * dy <= r2) self.set(x, y, pixel);
+                const d = @sqrt(dx * dx + dy * dy);
+                self.blendCoverage(x, y, pixel, std.math.clamp(radius - d + 0.5, 0, 1));
             }
         }
     }
 
-    /// Circle outline of the given thickness, used for the loupe ring.
-    pub fn strokeCircle(
-        self: Canvas,
+    /// Anti-aliased circle outline. The coverage of a pixel in an annulus is the
+    /// coverage of the outer disc times how far past the inner edge it is, which
+    /// softens both boundaries and still degenerates to `fillCircleAA` when the
+    /// thickness swallows the inner radius.
+    pub fn strokeCircleAA(
+        self: *Canvas,
         center_x: f64,
         center_y: f64,
         radius: f64,
@@ -204,45 +222,61 @@ pub const Canvas = struct {
         pixel: u32,
     ) void {
         const inner = @max(0.0, radius - thickness);
-        const outer2 = radius * radius;
-        const inner2 = inner * inner;
-        const x0: i32 = @intFromFloat(@floor(center_x - radius));
-        const x1: i32 = @intFromFloat(@ceil(center_x + radius));
-        const y0: i32 = @intFromFloat(@floor(center_y - radius));
-        const y1: i32 = @intFromFloat(@ceil(center_y + radius));
+        const x0: i32 = @intFromFloat(@floor(center_x - radius - 1));
+        const x1: i32 = @intFromFloat(@ceil(center_x + radius + 1));
+        const y0: i32 = @intFromFloat(@floor(center_y - radius - 1));
+        const y1: i32 = @intFromFloat(@ceil(center_y + radius + 1));
         var y = y0;
         while (y <= y1) : (y += 1) {
             var x = x0;
             while (x <= x1) : (x += 1) {
                 const dx = @as(f64, @floatFromInt(x)) + 0.5 - center_x;
                 const dy = @as(f64, @floatFromInt(y)) + 0.5 - center_y;
-                const d2 = dx * dx + dy * dy;
-                if (d2 <= outer2 and d2 >= inner2) self.blend(x, y, pixel);
+                const d = @sqrt(dx * dx + dy * dy);
+                const outer_coverage = std.math.clamp(radius - d + 0.5, 0, 1);
+                if (outer_coverage <= 0) continue;
+                const inner_coverage = std.math.clamp(d - inner + 0.5, 0, 1);
+                self.blendCoverage(x, y, pixel, outer_coverage * inner_coverage);
             }
         }
     }
 
-    pub fn fillRoundedRect(self: Canvas, area: Rect, radius: f64, pixel: u32) void {
-        const r = area.clamped(self.width, self.height);
+    /// Anti-aliased rounded rectangle, used for the badge pills. Each row's
+    /// edges are computed as exact positions and the boundary pixels are blended
+    /// with the fraction of themselves that falls inside, so the corners are
+    /// smooth instead of stepping a whole pixel at a time.
+    pub fn fillRoundedRect(self: *Canvas, area: Rect, radius: f64, pixel: u32) void {
+        const r = self.work(area);
         if (r.isEmpty()) return;
         if (radius <= 0.5) {
             self.blendRect(r, pixel);
             return;
         }
+        const top: f64 = @floatFromInt(r.y);
+        const bottom: f64 = @floatFromInt(r.maxY());
         var y = r.y;
         while (y < r.maxY()) : (y += 1) {
-            const dy_top = @as(f64, @floatFromInt(y)) + 0.5 - (@as(f64, @floatFromInt(r.y)) + radius);
-            const dy_bottom = @as(f64, @floatFromInt(y)) + 0.5 -
-                (@as(f64, @floatFromInt(r.maxY())) - radius);
+            const centre: f64 = @as(f64, @floatFromInt(y)) + 0.5;
             var inset: f64 = 0;
-            if (dy_top < 0) {
-                inset = radius - @sqrt(@max(0.0, radius * radius - dy_top * dy_top));
-            } else if (dy_bottom > 0) {
-                inset = radius - @sqrt(@max(0.0, radius * radius - dy_bottom * dy_bottom));
+            if (centre < top + radius) {
+                const dy = radius - (centre - top);
+                inset = radius - @sqrt(@max(0.0, radius * radius - dy * dy));
+            } else if (centre > bottom - radius) {
+                const dy = radius - (bottom - centre);
+                inset = radius - @sqrt(@max(0.0, radius * radius - dy * dy));
             }
-            const x0 = r.x + @as(i32, @intFromFloat(@floor(inset)));
-            const x1 = r.maxX() - @as(i32, @intFromFloat(@floor(inset)));
-            self.blendRect(.{ .x = x0, .y = y, .w = x1 - x0, .h = 1 }, pixel);
+            const left: f64 = @as(f64, @floatFromInt(r.x)) + inset;
+            const right: f64 = @as(f64, @floatFromInt(r.maxX())) - inset;
+            if (right <= left) continue;
+
+            var x: i32 = @intFromFloat(@floor(left - 0.5));
+            const last: i32 = @intFromFloat(@ceil(right));
+            while (x <= last) : (x += 1) {
+                const pixel_left: f64 = @floatFromInt(x);
+                const span = @min(pixel_left + 1, right) - @max(pixel_left, left);
+                if (span <= 0) continue;
+                self.blendCoverage(x, y, pixel, span);
+            }
         }
     }
 };
