@@ -1,0 +1,188 @@
+{
+  "source": "glyphs.png",
+  "sha256": "2b45a35466a5722c16d3af17107629c536c5fd1e9c1c95fdde812d999d259ef4",
+  "viewBox": [
+    0,
+    0,
+    29,
+    44
+  ],
+  "advance": 29,
+  "tracing": {
+    "blur": 0.35,
+    "iso": 128,
+    "simplify": 0.18,
+    "cornerDeg": 150,
+    "grain": 0
+  },
+  "glyphs": {
+    "0": {
+      "kind": "extracted",
+      "crop": [
+        119,
+        303,
+        153,
+        347
+      ],
+      "file": "0.svg"
+    },
+    "1": {
+      "kind": "extracted",
+      "crop": [
+        203,
+        361,
+        237,
+        405
+      ],
+      "file": "1.svg"
+    },
+    "2": {
+      "kind": "extracted",
+      "crop": [
+        379,
+        187,
+        413,
+        231
+      ],
+      "file": "2.svg"
+    },
+    "3": {
+      "kind": "extracted",
+      "crop": [
+        407,
+        535,
+        441,
+        579
+      ],
+      "file": "3.svg"
+    },
+    "4": {
+      "kind": "extracted",
+      "crop": [
+        235,
+        303,
+        269,
+        347
+      ],
+      "file": "4.svg"
+    },
+    "5": {
+      "kind": "extracted",
+      "crop": [
+        553,
+        245,
+        587,
+        289
+      ],
+      "file": "5.svg"
+    },
+    "6": {
+      "kind": "extracted",
+      "crop": [
+        582,
+        245,
+        616,
+        289
+      ],
+      "file": "6.svg"
+    },
+    "7": {
+      "kind": "extracted",
+      "crop": [
+        871,
+        651,
+        905,
+        695
+      ],
+      "file": "7.svg"
+    },
+    "8": {
+      "kind": "extracted",
+      "crop": [
+        524,
+        245,
+        558,
+        289
+      ],
+      "file": "8.svg"
+    },
+    "9": {
+      "kind": "extracted",
+      "crop": [
+        292,
+        709,
+        326,
+        753
+      ],
+      "file": "9.svg"
+    },
+    "A": {
+      "kind": "extracted",
+      "crop": [
+        32,
+        303,
+        66,
+        347
+      ],
+      "file": "A.svg"
+    },
+    "B": {
+      "kind": "extracted",
+      "crop": [
+        205,
+        187,
+        239,
+        231
+      ],
+      "file": "B.svg"
+    },
+    "C": {
+      "kind": "extracted",
+      "crop": [
+        32,
+        419,
+        66,
+        463
+      ],
+      "file": "C.svg"
+    },
+    "D": {
+      "kind": "extracted",
+      "crop": [
+        1131,
+        477,
+        1165,
+        521
+      ],
+      "file": "D.svg"
+    },
+    "E": {
+      "kind": "extracted",
+      "crop": [
+        119,
+        187,
+        153,
+        231
+      ],
+      "file": "E.svg"
+    },
+    "F": {
+      "kind": "extracted",
+      "crop": [
+        321,
+        303,
+        355,
+        347
+      ],
+      "file": "F.svg"
+    },
+    "#": {
+      "kind": "reconstructed",
+      "file": "hash.svg"
+    },
+    "\u00d7": {
+      "kind": "reconstructed",
+      "file": "times.svg"
+    }
+  }
+}

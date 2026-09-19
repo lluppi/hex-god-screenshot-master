@@ -1,82 +1,94 @@
 #!/usr/bin/env python3
-"""Bake a small monospace bitmap font into src/core/font_data.zig.
+"""Bake the specimen glyphs in assets/font/ into src/core/font_data.zig.
 
-The loupe badge only ever prints hex colours and pixel dimensions, so we bake
-just the glyphs those strings need. Rendering the glyphs with PIL at build-of-
-this-script time gives far better shapes than hand-typed 5x7 matrices, and the
-result is a dependency-free zig source file.
+The glyphs are SVG outlines, but the renderer draws from a plain ink mask, so
+each outline is rasterised at SUPERSAMPLE times the cell it is drawn at, then
+thresholded to one bit per sample. src/core/font.zig box filters that mask down
+when drawing, which is what gives the strokes a proportional anti-aliased edge.
 
-The mask is stored at SUPERSAMPLE times the cell size it is drawn at, as a plain
-ink mask, and src/core/font.zig box-filters it down when drawing. That is what
-makes the text smooth: scaling a 1x ink mask with nearest-neighbour (what this
-used to do) gives every stroke a different width, which reads as jagged.
+Every glyph is placed by the same rule - cap top on CAP_TOP, baseline on
+BASELINE - so the set shares one scale and one baseline instead of each outline
+being stretched to its own bounding box.
 
 Usage: python3 tools/gen-font.py > src/core/font_data.zig
+Requires rsvg-convert and Pillow.
 """
 
-from PIL import Image, ImageDraw, ImageFont
+import io
+import re
+import subprocess
+import sys
+from pathlib import Path
 
-FONT_CANDIDATES = [
-    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-]
-POINT_SIZE = 13
-GLYPHS = " #0123456789ABCDEFPX\u00d7px"
+from PIL import Image
+
+ASSETS = Path(__file__).resolve().parent.parent / "assets" / "font"
+GLYPHS = "#0123456789ABCDEF\u00d7"
+FILENAMES = {"#": "hash", "\u00d7": "times"}
+
 CELL_WIDTH = 8
 CELL_HEIGHT = 14
 SUPERSAMPLE = 4
-THRESHOLD = 100
+MASK_WIDTH = CELL_WIDTH * SUPERSAMPLE
+MASK_HEIGHT = CELL_HEIGHT * SUPERSAMPLE
+
+# The assets share a 29x44 design box in which the cap top is at CAP_TOP and the
+# baseline at BASELINE. The box maps to the full mask width, and the baseline is
+# pinned to BASELINE_MASK, matching the mask the renderer was tuned against.
+DESIGN_WIDTH = 29.0
+CAP_TOP = 5.0
+BASELINE = 38.0
+BASELINE_MASK = 46.0
+THRESHOLD = 128
 
 
-def load_font():
-    for path in FONT_CANDIDATES:
-        try:
-            return ImageFont.truetype(path, POINT_SIZE * SUPERSAMPLE)
-        except OSError:
-            continue
-    raise SystemExit("no usable monospace font found")
+def glyph_mask(char):
+    """Rasterise one asset into an ink mask, one bit per sample."""
+    source = (ASSETS / f"{FILENAMES.get(char, char)}.svg").read_text()
+    paths = re.findall(r"<path[^>]*/>", source)
+    if not paths:
+        raise SystemExit(f"{char}: no paths in asset")
+
+    scale = MASK_WIDTH / DESIGN_WIDTH
+    translate = BASELINE_MASK - BASELINE * scale
+    wrapped = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{MASK_WIDTH}" '
+        f'height="{MASK_HEIGHT}" viewBox="0 0 {MASK_WIDTH} {MASK_HEIGHT}">'
+        f'<g fill="#fff" transform="translate(0,{translate:.4f}) '
+        f'scale({scale:.6f})">{"".join(paths)}</g></svg>'
+    )
+    rendered = subprocess.run(
+        ["rsvg-convert", "-w", str(MASK_WIDTH), "-h", str(MASK_HEIGHT)],
+        input=wrapped.encode(), capture_output=True, check=True,
+    ).stdout
+
+    with Image.open(io.BytesIO(rendered)) as image:
+        gray = image.convert("L")
+        rows = []
+        for y in range(MASK_HEIGHT):
+            bits = 0
+            for x in range(MASK_WIDTH):
+                if gray.getpixel((x, y)) >= THRESHOLD:
+                    bits |= 1 << (MASK_WIDTH - 1 - x)
+            rows.append(bits)
+    return rows
 
 
 def main():
-    font = load_font()
-    ascent, descent = font.getmetrics()
-    mask_width = CELL_WIDTH * SUPERSAMPLE
-    mask_height = CELL_HEIGHT * SUPERSAMPLE
-
-    rows = []
-    for ch in GLYPHS:
-        image = Image.new("L", (mask_width * 2, mask_height * 2), 0)
-        draw = ImageDraw.Draw(image)
-        bbox = draw.textbbox((0, 0), ch, font=font)
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-        x = (mask_width - width) // 2 - bbox[0]
-        y = (ascent - height) // 2 - bbox[1]
-        draw.text((x, y), ch, fill=255, font=font)
-
-        cell = []
-        for row in range(mask_height):
-            bits = 0
-            for column in range(mask_width):
-                if image.getpixel((column, row)) >= THRESHOLD:
-                    bits |= 1 << (mask_width - 1 - column)
-            cell.append(bits)
-        rows.append((ch, cell))
+    if len(GLYPHS) != len(set(GLYPHS)):
+        raise SystemExit("duplicate characters in GLYPHS")
 
     print("//! Generated by tools/gen-font.py - do not edit by hand.")
-    print("//! JetBrains Mono / Noto Sans Mono derived glyph masks,")
-    print("//! rendered at point size", POINT_SIZE * SUPERSAMPLE, "and thresholded into a")
-    print(f"//! {mask_width}x{mask_height} ink mask, which src/core/font.zig box filters")
-    print("//! down to the requested size. cell_width/cell_height are the size the")
-    print("//! mask is drawn at; the mask is supersample times larger.")
+    print("//! Specimen glyph outlines from assets/font/*.svg, rasterised at")
+    print(f"//! {SUPERSAMPLE}x into a {MASK_WIDTH}x{MASK_HEIGHT} ink mask, which src/core/font.zig")
+    print("//! box filters down to the requested size. cell_width/cell_height are the")
+    print("//! size the mask is drawn at; the mask is supersample times larger.")
     print()
     print(f"pub const cell_width: u32 = {CELL_WIDTH};")
     print(f"pub const cell_height: u32 = {CELL_HEIGHT};")
     print(f"pub const supersample: u32 = {SUPERSAMPLE};")
-    print(f"pub const mask_width: u32 = {mask_width};")
-    print(f"pub const mask_height: u32 = {mask_height};")
+    print(f"pub const mask_width: u32 = {MASK_WIDTH};")
+    print(f"pub const mask_height: u32 = {MASK_HEIGHT};")
     print()
     print("pub const Glyph = struct {")
     print("    char: u8,")
@@ -85,14 +97,15 @@ def main():
     print("};")
     print()
     print("pub const glyphs = [_]Glyph{")
-    for ch, cell in rows:
-        shown = ch if ch != " " else "space"
+    for char in GLYPHS:
+        rows = glyph_mask(char)
+        shown = char if char != " " else "space"
         print(f'    // "{shown}"')
         print("    .{")
-        print(f"        .char = {ord(ch)},")
+        print(f"        .char = {ord(char)},")
         print("        .rows = .{")
-        for offset in range(0, mask_height, 4):
-            chunk = ", ".join(f"0x{value:08X}" for value in cell[offset:offset + 4])
+        for offset in range(0, MASK_HEIGHT, 4):
+            chunk = ", ".join(f"0x{value:08X}" for value in rows[offset:offset + 4])
             print(f"            {chunk},")
         print("        },")
         print("    },")
@@ -107,4 +120,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

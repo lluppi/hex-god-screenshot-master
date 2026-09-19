@@ -20,15 +20,55 @@ const geom = @import("geom.zig");
 const Canvas = canvas_mod.Canvas;
 const Rect = geom.Rect;
 
-pub const window_width: f64 = 116;
-pub const window_height: f64 = 145;
-pub const circle_diameter: f64 = 110;
-/// Distance from the window's top-left corner to the cursor: the loupe centre.
-pub const cursor_inset: f64 = 58;
+/// Half-width, in device pixels, of the tent-shaped reconstruction filter that
+/// every circular edge is drawn through.
+///
+/// Exact pixel-area coverage (a box filter) is what a ~1px curve looks ropey
+/// under: where the stroke lands on one pixel column it renders at full white,
+/// where it straddles two it renders as a pair at ~60%, and on the diagonal it
+/// becomes a chain of single bright pixels. The total ink per unit of arc is
+/// constant, but the *peak* jumps with the sub-pixel phase, and that beading is
+/// what reads as jaggedness. Text and 2D renderers low-pass the coverage
+/// with a filter wider than a pixel for exactly this reason (FreeType's LCD FIR
+/// filter, Skia's two-pixel hairline ramps, the >1px kernels of film
+/// renderers). A tent of this radius trades a little crispness for a stroke
+/// whose brightness barely changes as it sweeps through the pixel grid.
+const filter_radius: f64 = 1.0;
 
-/// Physical pixels sampled around the cursor: the loupe is 110px wide, so a
-/// 21x21 sample gives roughly 5 screen pixels per loupe pixel at 1x.
-pub const sample_side: u32 = 21;
+/// Fraction of the pixel filter that lies on the inside of a straight edge
+/// passing `inside` pixels from the pixel centre (positive when the centre
+/// itself is inside). This is the tent kernel's integral, so it is C1: no
+/// kink where the ramp meets full or zero coverage.
+fn edgeWeight(inside: f64) f64 {
+    if (inside <= -filter_radius) return 0;
+    if (inside >= filter_radius) return 1;
+    const t = (inside + filter_radius) / (2 * filter_radius);
+    return if (t < 0.5) 2 * t * t else 1 - 2 * (1 - t) * (1 - t);
+}
+
+/// Filtered coverage of the disc of `radius` for a pixel whose centre is `dist`
+/// from the disc centre. The circle is treated as a straight edge across the
+/// filter's support: with radii of 90px and up the arc sags less than 0.01px
+/// over that span, far below one level of the 8-bit output.
+fn discWeight(radius: f64, dist: f64) f64 {
+    return edgeWeight(radius - dist);
+}
+
+/// Gap between the circle and the window edge on the left, right and top.
+const margin: f64 = 3;
+/// How far the window extends below the circle, where the hex badge sits.
+const below_circle: f64 = 32;
+
+pub const circle_diameter: f64 = 180;
+pub const window_width: f64 = circle_diameter + 2 * margin;
+pub const window_height: f64 = circle_diameter + margin + below_circle;
+/// Distance from the window's top-left corner to the cursor: the loupe centre.
+pub const cursor_inset: f64 = circle_diameter / 2 + margin;
+
+/// Physical pixels sampled around the cursor. The circle is `circle_diameter`
+/// wide, so a 13x13 sample gives roughly 14 loupe pixels per screen pixel at 1x.
+/// Kept odd so the sample has a true centre pixel: that is the colour copied.
+pub const sample_side: u32 = 13;
 
 pub fn ringRadius(ui_scale: f64) f64 {
     return circle_diameter * ui_scale / 2.0;
@@ -61,7 +101,7 @@ pub fn windowRect(origin: geom.Point, ui_scale: f64) Rect {
 }
 
 /// Everything inside the disc for one pixel: the magnified sample, the cell
-/// grid and the centre target, stacked.
+/// grid and the ring, stacked.
 const Disc = struct {
     sample: Canvas,
     /// Canvas coordinates of the disc's bounding square.
@@ -70,16 +110,20 @@ const Disc = struct {
     diameter: i32,
     /// Grid line positions, in pixels from the bounding square's edge.
     grid: [sample_side]i32,
-    target: Rect,
-    target_outline: i32,
+    centre_x: f64,
+    centre_y: f64,
+    radius: f64,
+    ring: f64,
+    separator: f64,
 
     const body_colour = color.solid(.{ .r = 0x1e, .g = 0x1e, .b = 0x1e });
     const grid_ink = color.black(40);
-    const target_ink = color.solid(.{ .r = 0, .g = 0, .b = 0 });
-    const target_highlight = color.solid(.{ .r = 255, .g = 255, .b = 255 });
+    const ring_ink = color.solid(.{ .r = 255, .g = 255, .b = 255 });
 
-    /// The composited colour for a pixel `dx`, `dy` from the square's top left.
-    fn pixelAt(self: Disc, dx: i32, dy: i32) u32 {
+    /// The composited colour for a pixel `dx`, `dy` from the square's top left,
+    /// whose centre is `dist` from the disc centre and whose filtered disc
+    /// coverage is `outer` (> 0).
+    fn pixelAt(self: Disc, dx: i32, dy: i32, dist: f64, outer: f64) u32 {
         var pixel = body_colour;
         if (self.sample.width > 0 and self.sample.height > 0) {
             if (dx >= 0 and dy >= 0 and dx < self.diameter and dy < self.diameter) {
@@ -93,30 +137,46 @@ const Disc = struct {
 
         for (self.grid) |offset| {
             if (offset == 0) continue;
-            if (dx == offset or dy == offset) pixel = color.over(pixel, grid_ink);
+            if (dx == offset or dy == offset) pixel = color.overLinear(pixel, grid_ink);
         }
 
-        const x = self.left + dx;
-        const y = self.top + dy;
-        if (inStroke(x, y, self.target.expand(self.target_outline), self.target_outline * 2)) {
-            pixel = color.over(pixel, target_ink);
+        return self.withRing(pixel, dist, outer);
+    }
+
+    /// The ring is part of the same stack as everything else, so the silhouette
+    /// is anti-aliased exactly once (see `render`). Only the ring's *inner*
+    /// boundaries are softened here; its outer boundary is the disc's edge and
+    /// belongs to the single coverage multiply at the end.
+    fn withRing(self: Disc, base: u32, dist: f64, outer: f64) u32 {
+        const ring_inner = self.radius - self.ring;
+        const separator_inner = ring_inner - self.separator;
+        // Everything inside the separator's inner edge, less the filter's
+        // reach, is plain magnified content: the common case, so leave early.
+        if (dist < separator_inner - filter_radius) return base;
+
+        // The three bands are nested discs, so each band's weight is the
+        // difference of two disc weights, all through the same filter.
+        const white_inner = discWeight(ring_inner, dist);
+        const separator_inner_weight = discWeight(separator_inner, dist);
+
+        // Coverage is conditional on being inside the disc. The outer coverage
+        // is applied once in `render`; conditioning here avoids multiplying the
+        // same edge coverage twice where a thin ring meets the silhouette.
+        const white = std.math.clamp((outer - white_inner) / outer, 0, 1);
+        const separator = std.math.clamp((white_inner - separator_inner_weight) / outer, 0, 1);
+
+        var pixel = base;
+        // The bands are disjoint. Account for the white band's later src-over
+        // coverage so the separator retains exactly its filtered weight instead
+        // of being faded a second time beneath the white.
+        if (separator > 0 and white < 1) {
+            const separator_before_white = @min(1, separator / (1 - white));
+            pixel = color.overLinear(pixel, color.withCoverage(grid_ink, separator_before_white));
         }
-        if (inStroke(x, y, self.target, self.target_outline)) {
-            pixel = color.over(pixel, target_highlight);
-        }
+        if (white > 0) pixel = color.overLinear(pixel, color.withCoverage(ring_ink, white));
         return pixel;
     }
 };
-
-/// True when (x, y) is in the `thickness` wide border of `rect`.
-fn inStroke(x: i32, y: i32, rect: Rect, thickness: i32) bool {
-    if (thickness <= 0) return false;
-    if (x < rect.x or y < rect.y or x >= rect.maxX() or y >= rect.maxY()) return false;
-    return x < rect.x + thickness or
-        x >= rect.maxX() - thickness or
-        y < rect.y + thickness or
-        y >= rect.maxY() - thickness;
-}
 
 /// Draw the whole loupe: disc, ring, badge.
 ///
@@ -126,6 +186,12 @@ fn inStroke(x: i32, y: i32, rect: Rect, thickness: i32) bool {
 /// edge, which is what left the circle looking rough. Grid lines are part of the
 /// same pass and are clipped by the disc's coverage, so they cannot bleed into
 /// the corners of the bounding square.
+///
+/// The ring is in that pass too. Stroking it as a separate anti-aliased circle
+/// applied a second coverage ramp on top of the disc's, so the silhouette came
+/// out as `2c - c^2` instead of `c`: a half-covered edge pixel was drawn at 75%
+/// and the whole ramp collapsed into roughly one hard pixel. One stack, one
+/// coverage multiply, one edge.
 pub fn render(canvas: *Canvas, origin: geom.Point, sample: Canvas, ui_scale: f64) void {
     const window = windowRect(origin, ui_scale);
     if (!window.intersects(canvas.rect())) return;
@@ -135,57 +201,70 @@ pub fn render(canvas: *Canvas, origin: geom.Point, sample: Canvas, ui_scale: f64
     const diameter: i32 = @intFromFloat(@round(circle_diameter * ui_scale));
     const left = window.x + inset - @divTrunc(diameter, 2);
     const top = window.y + inset - @divTrunc(diameter, 2);
-    const centre_x = @as(f64, @floatFromInt(left)) + @as(f64, @floatFromInt(diameter)) / 2.0;
-    const centre_y = @as(f64, @floatFromInt(top)) + @as(f64, @floatFromInt(diameter)) / 2.0;
+    // The centre sits at the centre of the cursor's pixel, not on its top-left
+    // corner. Half a pixel sounds like nothing, but with an integer radius a
+    // corner-centred circle puts all four of its extremes exactly on a pixel
+    // boundary: the left and right flanks then have *no* partial pixel at all
+    // for a dozen rows, so they read as a dead straight run that suddenly jogs
+    // a whole pixel. Centred on the pixel, those flanks get a real half-covered
+    // column instead. It also matches how the sample below is indexed, by pixel
+    // centre, so the magnified content and the circle share one origin.
+    const centre_x = @as(f64, @floatFromInt(left)) + @as(f64, @floatFromInt(diameter)) / 2.0 + 0.5;
+    const centre_y = @as(f64, @floatFromInt(top)) + @as(f64, @floatFromInt(diameter)) / 2.0 + 0.5;
 
+    // A cell boundary lands at `step * diameter / sample_side`; the first pixel
+    // *of* the next cell is the one at or past it, so this rounds up. Rounding
+    // down drew every grid line one pixel to the left of the cell it divides.
     var grid: [sample_side]i32 = @splat(0);
     var step: i32 = 1;
     while (step < sample_side) : (step += 1) {
-        grid[@intCast(step)] = @intCast(@as(u64, @intCast(step)) * @as(u64, @intCast(diameter)) / sample_side);
+        const scaled = @as(u64, @intCast(step)) * @as(u64, @intCast(diameter));
+        grid[@intCast(step)] = @intCast((scaled + sample_side - 1) / sample_side);
     }
 
-    const cell: i32 = @intCast(@as(u64, @intCast(diameter)) / sample_side);
-    const centre_cell: i32 = @intCast(@as(u64, sample_side / 2) * @as(u64, @intCast(diameter)) / sample_side);
     const disc = Disc{
         .sample = sample,
         .left = left,
         .top = top,
         .diameter = diameter,
         .grid = grid,
-        .target = .{ .x = left + centre_cell, .y = top + centre_cell, .w = cell, .h = cell },
-        .target_outline = @max(1, @as(i32, @intFromFloat(@round(2 * ui_scale)))),
+        .centre_x = centre_x,
+        .centre_y = centre_y,
+        .radius = radius,
+        .ring = ring_thickness * ui_scale,
+        .separator = separator_thickness * ui_scale,
     };
 
-    // One pixel of margin so the outer half of the coverage ramp is covered.
-    var dy: i32 = -1;
-    while (dy <= diameter) : (dy += 1) {
-        var dx: i32 = -1;
-        while (dx <= diameter) : (dx += 1) {
+    // Walk the radius rather than the rounded bounding square, with the
+    // filter's reach plus a pixel of margin, so the outer half of the coverage
+    // ramp is always inside the loop even when rounding leaves the square a
+    // little tight or lopsided.
+    const reach = radius + filter_radius + 1;
+    const first_x: i32 = @as(i32, @intFromFloat(@floor(centre_x - reach))) - left;
+    const last_x: i32 = @as(i32, @intFromFloat(@ceil(centre_x + reach))) - left;
+    const first_y: i32 = @as(i32, @intFromFloat(@floor(centre_y - reach))) - top;
+    const last_y: i32 = @as(i32, @intFromFloat(@ceil(centre_y + reach))) - top;
+
+    var dy: i32 = first_y;
+    while (dy <= last_y) : (dy += 1) {
+        const py = @as(f64, @floatFromInt(top + dy)) + 0.5 - centre_y;
+        var dx: i32 = first_x;
+        while (dx <= last_x) : (dx += 1) {
             const px = @as(f64, @floatFromInt(left + dx)) + 0.5 - centre_x;
-            const py = @as(f64, @floatFromInt(top + dy)) + 0.5 - centre_y;
-            const coverage = std.math.clamp(radius - @sqrt(px * px + py * py) + 0.5, 0, 1);
+            const dist = @sqrt(px * px + py * py);
+            const coverage = discWeight(radius, dist);
             if (coverage <= 0) continue;
-            canvas.blendCoverage(left + dx, top + dy, disc.pixelAt(dx, dy), coverage);
+            canvas.blendCoverageLinear(left + dx, top + dy, disc.pixelAt(dx, dy, dist, coverage), coverage);
         }
     }
 
-    drawRing(canvas, centre_x, centre_y, ui_scale);
     drawHexBadge(canvas, window, sample, ui_scale);
 }
 
-/// A white ring with a dark separator just inside it, so the ring reads against
-/// both light and dark content underneath.
-fn drawRing(canvas: *Canvas, centre_x: f64, centre_y: f64, ui_scale: f64) void {
-    const radius = ringRadius(ui_scale);
-    const thickness = ring_thickness * ui_scale;
-    canvas.strokeCircleAA(centre_x, centre_y, radius, thickness, color.solid(.{ .r = 255, .g = 255, .b = 255 }));
-    canvas.strokeCircleAA(centre_x, centre_y, radius - thickness, separator_thickness * ui_scale, color.black(184));
-}
-
-/// Ring width in points. Wider than a hairline on purpose: a ~1px curve has no
-/// pixel area to anti-alias, so it reads as a stair-stepped line however good the
-/// coverage maths is.
-pub const ring_thickness: f64 = 2.0;
+/// Ring width in points. Subpixel coverage keeps this hairline smooth at 1x
+/// while higher-density displays naturally give it more physical pixels.
+pub const ring_thickness: f64 = 1.0;
+/// Inner separator uses the same ink and width as the sample grid.
 pub const separator_thickness: f64 = 1.0;
 
 fn drawHexBadge(canvas: *Canvas, window: Rect, sample: Canvas, ui_scale: f64) void {

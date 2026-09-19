@@ -2,7 +2,14 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // This is an interactive full-screen overlay, so make ordinary `zig build`
+    // produce the responsive binary used by the compositor keybind. Developers
+    // can still request a debug build explicitly with `-Doptimize=Debug`.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse .ReleaseFast;
 
     const os_tag = target.result.os.tag;
 

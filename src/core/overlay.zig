@@ -66,7 +66,7 @@ fn paintSelection(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) 
     paintSizeBadge(canvas, scene, selection, region);
 }
 
-/// The "W x H px" pill that follows the cursor while dragging.
+/// The "W x H" pill that follows the cursor while dragging.
 pub const SizeBadge = struct {
     rect: Rect,
     text: [32]u8,
@@ -93,7 +93,7 @@ pub fn sizeBadge(
     var text_buffer: [32]u8 = undefined;
     const text = std.fmt.bufPrint(
         &text_buffer,
-        "{d}\xd7{d} px",
+        "{d}\xd7{d}",
         .{ selection.w, selection.h },
     ) catch return null;
 

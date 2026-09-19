@@ -190,35 +190,17 @@ pub const Canvas = struct {
         self.blend(x, y, scaled);
     }
 
-    /// Anti-aliased circle outline. The coverage of a pixel in an annulus is the
-    /// coverage of the outer disc times how far past the inner edge it is, which
-    /// softens both boundaries when the thickness leaves an inner radius.
-    pub fn strokeCircleAA(
-        self: *Canvas,
-        center_x: f64,
-        center_y: f64,
-        radius: f64,
-        thickness: f64,
-        pixel: u32,
-    ) void {
-        const inner = @max(0.0, radius - thickness);
-        const x0: i32 = @intFromFloat(@floor(center_x - radius - 1));
-        const x1: i32 = @intFromFloat(@ceil(center_x + radius + 1));
-        const y0: i32 = @intFromFloat(@floor(center_y - radius - 1));
-        const y1: i32 = @intFromFloat(@ceil(center_y + radius + 1));
-        var y = y0;
-        while (y <= y1) : (y += 1) {
-            var x = x0;
-            while (x <= x1) : (x += 1) {
-                const dx = @as(f64, @floatFromInt(x)) + 0.5 - center_x;
-                const dy = @as(f64, @floatFromInt(y)) + 0.5 - center_y;
-                const d = @sqrt(dx * dx + dy * dy);
-                const outer_coverage = std.math.clamp(radius - d + 0.5, 0, 1);
-                if (outer_coverage <= 0) continue;
-                const inner_coverage = std.math.clamp(d - inner + 0.5, 0, 1);
-                self.blendCoverage(x, y, pixel, outer_coverage * inner_coverage);
-            }
-        }
+    /// `blendCoverage`, mixing in linear light. The loupe's silhouette uses this
+    /// because a bright curve on dark content is where sRGB-space blending is
+    /// visibly wrong: the partial pixels come out too dark and the edge reads as
+    /// a stair rather than a ramp.
+    pub fn blendCoverageLinear(self: *Canvas, x: i32, y: i32, pixel: u32, coverage: f64) void {
+        if (coverage <= 0) return;
+        if (!self.writable(x, y)) return;
+        const scaled = if (coverage >= 1) pixel else color.withCoverage(pixel, coverage);
+        if (scaled == 0) return;
+        const i = self.index(x, y);
+        self.pixels[i] = color.overLinear(self.pixels[i], scaled);
     }
 
     /// Anti-aliased rounded rectangle, used for the badge pills. Each row's

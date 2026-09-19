@@ -53,6 +53,63 @@ pub fn withCoverage(pixel: u32, coverage: f64) u32 {
     return (scaled << 24) | (red << 16) | (green << 8) | blue;
 }
 
+/// sRGB byte -> linear light. Screens encode roughly `v^2.2`, so averaging two
+/// encoded values is not averaging two amounts of light: a half-covered white
+/// edge pixel blended at 50% in encoded space emits about 21% of the light it
+/// should, which is why thin bright curves bead and look stair-stepped however
+/// exact the coverage is.
+const to_linear: [256]f32 = blk: {
+    @setEvalBranchQuota(100_000);
+    var table: [256]f32 = undefined;
+    for (&table, 0..) |*slot, i| {
+        const v: f64 = @as(f64, @floatFromInt(i)) / 255.0;
+        slot.* = @floatCast(if (v <= 0.04045)
+            v / 12.92
+        else
+            std.math.pow(f64, (v + 0.055) / 1.055, 2.4));
+    }
+    break :blk table;
+};
+
+/// Linear light -> the nearest sRGB byte, by binary search over `to_linear`, so
+/// the encode is exactly the inverse of the decode and needs no second table.
+fn fromLinear(value: f32) u32 {
+    const light = std.math.clamp(value, 0, 1);
+    var low: usize = 0;
+    var high: usize = 255;
+    while (low < high) {
+        const mid = (low + high + 1) / 2;
+        if (to_linear[mid] <= light) low = mid else high = mid - 1;
+    }
+    if (low < 255 and light - to_linear[low] > to_linear[low + 1] - light) return @intCast(low + 1);
+    return @intCast(low);
+}
+
+/// `over`, but the colour mix happens in linear light instead of in sRGB codes.
+/// Only the anti-aliased edges of the loupe go through this: it is where the
+/// gamma error is visible, and it costs three table lookups and a search.
+pub fn overLinear(dst: u32, src: u32) u32 {
+    const sa: u32 = (src >> 24) & 0xff;
+    if (sa == 0) return dst;
+    if (sa == 255) return src;
+
+    const alpha: f32 = @as(f32, @floatFromInt(sa)) / 255.0;
+    const keep = 1 - alpha;
+
+    // Un-premultiply so the source's own colour is decoded, not its faded form.
+    var out: u32 = 0;
+    inline for (.{ 16, 8, 0 }) |shift| {
+        const s: u32 = @min(255, (((src >> shift) & 0xff) * 255 + sa / 2) / sa);
+        const d: u32 = (dst >> shift) & 0xff;
+        const mixed = to_linear[s] * alpha + to_linear[d] * keep;
+        out |= fromLinear(mixed) << shift;
+    }
+
+    const da: u32 = (dst >> 24) & 0xff;
+    const a: u32 = @min(sa + (da * (255 - sa) + 128) / 255, 255);
+    return (a << 24) | out;
+}
+
 /// `#RRGGBB`, uppercase, exactly like the mac app printed.
 pub fn hexString(rgb: Rgb) [7]u8 {
     var out: [7]u8 = undefined;
