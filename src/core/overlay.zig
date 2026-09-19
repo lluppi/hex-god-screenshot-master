@@ -72,25 +72,39 @@ fn paintSelection(
     paintSizeBadge(canvas, scene, selection, region, ui_scale);
 }
 
-/// "W x H px" pill placed just below the cursor, clamped into the region.
-fn paintSizeBadge(
-    canvas: *Canvas,
-    scene: Scene,
-    selection: Rect,
-    region: Rect,
-    ui_scale: f64,
-) void {
-    const cursor = scene.cursor orelse return;
-    if (selection.w < 2 and selection.h < 2) return;
+/// The "W x H px" pill that follows the cursor while dragging.
+pub const SizeBadge = struct {
+    rect: Rect,
+    text: [32]u8,
+    len: usize,
 
-    const padding_x: i32 = @intFromFloat(@round(7 * ui_scale));
-    const padding_y: i32 = @intFromFloat(@round(4 * ui_scale));
+    /// Borrow the label. Takes a pointer on purpose: a by-value receiver would
+    /// return a slice into a parameter that dies with the call.
+    pub fn label(self: *const SizeBadge) []const u8 {
+        return self.text[0..self.len];
+    }
+};
+
+/// Geometry of the size pill for a selection, in canvas pixels. Frontends use
+/// this both to draw it and to damage the area it occupies, which is outside the
+/// selection rectangle and therefore easy to forget.
+pub fn sizeBadge(
+    selection: Rect,
+    cursor: Point,
+    ui_scale: f64,
+    canvas: Rect,
+) ?SizeBadge {
+    if (selection.w < 2 and selection.h < 2) return null;
+
     var text_buffer: [32]u8 = undefined;
     const text = std.fmt.bufPrint(
         &text_buffer,
         "{d}\xd7{d} px",
         .{ selection.w, selection.h },
-    ) catch return;
+    ) catch return null;
+
+    const padding_x: i32 = @intFromFloat(@round(7 * ui_scale));
+    const padding_y: i32 = @intFromFloat(@round(4 * ui_scale));
     const text_w = font.textWidth(text, ui_scale);
     const text_h = font.cellHeight(ui_scale);
     const badge_w = text_w + 2 * padding_x;
@@ -103,18 +117,45 @@ fn paintSizeBadge(
     const origin_x = std.math.clamp(
         anchor_x + offset,
         margin,
-        @as(i32, @intCast(canvas.width)) - badge_w - margin,
+        @max(margin, canvas.w - badge_w - margin),
     );
     const origin_y = std.math.clamp(
         anchor_y + offset,
         margin,
-        @as(i32, @intCast(canvas.height)) - badge_h - margin,
+        @max(margin, canvas.h - badge_h - margin),
     );
-    const badge = Rect{ .x = origin_x, .y = origin_y, .w = badge_w, .h = badge_h };
-    if (!badge.intersects(region)) return;
 
-    canvas.fillRoundedRect(badge, 5 * ui_scale, color.black(209));
-    font.draw(canvas, badge.x + padding_x, badge.y + padding_y, text, ui_scale, color.solid(.{ .r = 255, .g = 255, .b = 255 }));
+    var badge = SizeBadge{
+        .rect = .{ .x = origin_x, .y = origin_y, .w = badge_w, .h = badge_h },
+        .text = undefined,
+        .len = text.len,
+    };
+    @memcpy(badge.text[0..text.len], text);
+    return badge;
+}
+
+fn paintSizeBadge(
+    canvas: *Canvas,
+    scene: Scene,
+    selection: Rect,
+    region: Rect,
+    ui_scale: f64,
+) void {
+    const cursor = scene.cursor orelse return;
+    const badge = sizeBadge(selection, cursor, ui_scale, canvas.rect()) orelse return;
+    if (!badge.rect.intersects(region)) return;
+
+    const padding_x: i32 = @intFromFloat(@round(7 * ui_scale));
+    const padding_y: i32 = @intFromFloat(@round(4 * ui_scale));
+    canvas.fillRoundedRect(badge.rect, 5 * ui_scale, color.black(209));
+    font.draw(
+        canvas,
+        badge.rect.x + padding_x,
+        badge.rect.y + padding_y,
+        badge.label(),
+        ui_scale,
+        color.solid(.{ .r = 255, .g = 255, .b = 255 }),
+    );
 }
 
 /// Region of the canvas the loupe touches, so frontends can damage and repaint

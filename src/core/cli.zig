@@ -78,5 +78,12 @@ pub fn printUsage() void {
         \\  --shot X,Y,W,H       copy a logical rectangle as a PNG screenshot
         \\  --info               print the displays and their scales
         \\
+        \\ Development: drive a synthetic gesture through the real handlers,
+        \\ so the click and drag paths can be exercised from a script.
+        \\  --dev-click X,Y      click at a logical point
+        \\  --dev-drag X,Y,W,H   drag from X,Y to X+W,Y+H
+        \\  --dev-via X,Y        pause at a mid point during the drag
+        \\  --dev-hold MS        how long to hold each step (default 1000)
+        \\
     , .{});
 }

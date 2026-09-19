@@ -48,6 +48,9 @@ const Display = struct {
     window: id = null,
     view: id = null,
     dirty: std.ArrayList(Rect) = .empty,
+    /// Where the size badge was last drawn, so the next move can erase it. The
+    /// badge sits outside the selection rectangle, so it needs its own damage.
+    last_badge: ?Rect = null,
 
     fn localLogical(self: *Display, global: Point) Point {
         return .{ .x = global.x - self.logical.x, .y = global.y - self.logical.y };
@@ -503,6 +506,21 @@ fn updateSelection(app: *App) void {
         }
         if (next) |rect| {
             if (rectPhysical(display, rect)) |physical| damage = damage.unionWith(physical);
+        }
+        // The size badge is drawn beside the cursor, outside the selection, so it
+        // has to be damaged explicitly or it is composed nowhere.
+        if (display.last_badge) |previous_badge| damage = damage.unionWith(previous_badge);
+        display.last_badge = null;
+        if (next) |rect| {
+            if (rectPhysical(display, rect)) |physical| {
+                if (cursorPhysical(display)) |cursor| {
+                    const canvas_rect = if (display.canvas) |canvas| canvas.rect() else Rect{};
+                    if (overlay_mod.sizeBadge(physical, cursor, display.scale, canvas_rect)) |badge| {
+                        damage = damage.unionWith(badge.rect.expand(2));
+                        display.last_badge = badge.rect;
+                    }
+                }
+            }
         }
         if (!damage.isEmpty()) paintRegion(display, damage.expand(3));
     }

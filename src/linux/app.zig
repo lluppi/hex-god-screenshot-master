@@ -44,7 +44,7 @@ const btn_right: u32 = 0x111;
 const DevGesture = union(enum) {
     none,
     click: Point,
-    drag: struct { start: Point, end: Point, hold_ms: u64 },
+    drag: struct { start: Point, end: Point, via: ?Point, hold_ms: u64 },
 };
 
 fn parseDevGesture(
@@ -54,6 +54,7 @@ fn parseDevGesture(
 ) !DevGesture {
     var click: ?Point = null;
     var drag: ?[4]f64 = null;
+    var via: ?Point = null;
     var hold_ms: u64 = 1000;
 
     var index: usize = 0;
@@ -68,6 +69,10 @@ fn parseDevGesture(
             if (index >= args.len) return error.MissingRect;
             const rect = cli.parseRect(args[index]) orelse return error.MissingRect;
             drag = .{ rect.x, rect.y, rect.maxX(), rect.maxY() };
+        } else if (std.mem.eql(u8, arg, "--dev-via")) {
+            index += 1;
+            if (index >= args.len) return error.MissingPoint;
+            via = cli.parsePoint(args[index]) orelse return error.MissingPoint;
         } else if (std.mem.eql(u8, arg, "--dev-hold")) {
             index += 1;
             if (index >= args.len) return error.MissingRect;
@@ -81,6 +86,7 @@ fn parseDevGesture(
         return .{ .drag = .{
             .start = .{ .x = values[0], .y = values[1] },
             .end = .{ .x = values[2], .y = values[3] },
+            .via = via,
             .hold_ms = hold_ms,
         } };
     }
@@ -114,6 +120,9 @@ const Output = struct {
     dirty: [2]std.ArrayList(Rect) = .{ .empty, .empty },
     /// A buffer that has never been committed needs a full paint.
     fresh: [2]bool = .{ true, true },
+    /// Where the size badge was last drawn, so the next move can erase it. The
+    /// badge sits outside the selection rectangle, so it needs its own damage.
+    last_badge: ?Rect = null,
     surface: ?*wl.Obj = null,
     surface_version: u32 = 1,
     layer_surface: ?*wl.Obj = null,
@@ -194,6 +203,12 @@ pub const App = struct {
     cursor_buffer: ?*shm_mod.ShmBuffer = null,
 
     overlays_up: bool = false,
+    /// True while a synthetic gesture from --dev-click/--dev-drag is running.
+    /// Real pointer events are ignored for the duration: the compositor sends an
+    /// enter for the new overlay surface as soon as it appears under the physical
+    /// cursor, which would otherwise drag the synthetic selection back to wherever
+    /// the mouse actually is and make the harness non-deterministic.
+    dev_gesture_active: bool = false,
     quit: bool = false,
     exit_code: u8 = 0,
     pending_screenshot: ?FRect = null,
@@ -215,7 +230,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
     while (args.next()) |arg| raw.append(allocator, arg) catch return error.OutOfMemory;
     var rest: std.ArrayList([]const u8) = .empty;
     const dev_gesture = parseDevGesture(allocator, raw.items, &rest) catch {
-        out.fail("--dev-click needs X,Y; --dev-drag needs X,Y,X2,Y2; --dev-hold needs ms\n", .{});
+        out.fail(
+            "--dev-click X,Y | --dev-drag X,Y,W,H | --dev-via X,Y | --dev-hold MS\n",
+            .{},
+        );
         std.process.exit(2);
     };
 
@@ -280,8 +298,15 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             try startOverlay(&app);
             switch (dev_gesture) {
                 .none => try eventLoop(&app),
-                .click => |point| devClick(&app, point),
-                .drag => |drag| devDrag(&app, drag.start, drag.end, drag.hold_ms),
+                .click => |point| {
+                    app.dev_gesture_active = true;
+                    devClick(&app, point);
+                },
+                .drag => |drag| {
+                    app.dev_gesture_active = true;
+                    devDrag(&app, drag.start, drag.via, drag.end, drag.hold_ms);
+                    app.dev_gesture_active = false;
+                },
             }
             try eventLoop(&app);
             teardownOverlay(&app);
@@ -475,6 +500,7 @@ fn teardownOverlay(self: *App) void {
         }
         o.have_buffers = false;
         o.fresh = .{ true, true };
+        o.last_badge = null;
         for (&o.dirty) |*dirty| dirty.clearRetainingCapacity();
     }
     if (self.cursor_surface) |surface| {
@@ -699,6 +725,20 @@ fn updateSelection(self: *App) void {
         if (next) |rect| {
             if (selectionPhysicalOf(o, rect)) |physical| damage = damage.unionWith(physical);
         }
+        // The size badge is drawn beside the cursor, outside the selection, so it
+        // has to be damaged explicitly or it is composed nowhere.
+        if (o.last_badge) |previous_badge| damage = damage.unionWith(previous_badge);
+        o.last_badge = null;
+        if (next) |rect| {
+            if (selectionPhysicalOf(o, rect)) |physical| {
+                if (cursorPhysical(o)) |cursor| {
+                    if (overlay_mod.sizeBadge(physical, cursor, o.scale, o.canvasSize())) |badge| {
+                        damage = damage.unionWith(badge.rect.expand(2));
+                        o.last_badge = badge.rect;
+                    }
+                }
+            }
+        }
         if (!damage.isEmpty()) repaintOutput(self, o, damage.expand(3));
     }
 }
@@ -775,13 +815,20 @@ fn devClick(self: *App, point: Point) void {
 /// event loop, because a commit is only sent to the compositor on the next
 /// flush: without that the box would sit in our outgoing buffer and never be
 /// seen on screen.
-fn devDrag(self: *App, start: Point, end: Point, hold_ms: u64) void {
+fn devDrag(self: *App, start: Point, via: ?Point, end: Point, hold_ms: u64) void {
     devMoveCursor(self, start);
     if (self.cursor_output == null) return;
     hideLoupe(self);
     beginSelection(self);
+    if (via) |mid| {
+        devMoveCursor(self, mid);
+        out.print("dev: drag {d},{d} -> {d},{d}, holding\n", .{ start.x, start.y, mid.x, mid.y });
+        holdWithPump(self, hold_ms);
+    }
     devMoveCursor(self, end);
+    out.print("dev: drag {d},{d} -> {d},{d}, holding\n", .{ start.x, start.y, end.x, end.y });
     holdWithPump(self, hold_ms);
+    out.print("dev: releasing at {d},{d}\n", .{ end.x, end.y });
     endSelection(self);
 }
 
@@ -1293,6 +1340,7 @@ fn onPointerEnter(
 ) callconv(.c) void {
     _ = pointer;
     const app: *App = @ptrCast(@alignCast(data.?));
+    if (app.dev_gesture_active) return;
     app.pointer_serial = serial;
     app.last_serial = serial;
     applyCursor(app);
@@ -1308,6 +1356,7 @@ fn onPointerLeave(
 ) callconv(.c) void {
     _ = pointer;
     const app: *App = @ptrCast(@alignCast(data.?));
+    if (app.dev_gesture_active) return;
     app.last_serial = serial;
     const o = outputForSurface(app, surface) orelse return;
     if (app.cursor_output == o) app.cursor_output = null;
@@ -1324,6 +1373,7 @@ fn onPointerMotion(
     _ = pointer;
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
+    if (app.dev_gesture_active) return;
     const o = app.cursor_output orelse return;
     updateCursor(app, o, .{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) });
 }
@@ -1339,6 +1389,7 @@ fn onPointerButton(
     _ = pointer;
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
+    if (app.dev_gesture_active) return;
     app.last_serial = serial;
     app.pointer_serial = serial;
 

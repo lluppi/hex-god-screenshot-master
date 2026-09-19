@@ -4,7 +4,8 @@ One gesture, three outcomes:
 
 - **Hover** to inspect the exact pixel under the cursor in a live circular loupe.
 - **Click** to copy that pixel's uppercase hex colour, such as `#1D4ED8`.
-- **Drag** to measure a rectangle and copy its screenshot to the clipboard.
+- **Drag** to measure a rectangle and copy its screenshot to the clipboard, with
+  a live `W × H px` readout following the cursor.
 - **Escape** or right-click to cancel.
 
 Rewritten in zig with one shared core and a thin frontend per platform:
@@ -151,6 +152,14 @@ A repaint requested while both buffers look busy is composed anyway; the worst
 case is one frame landing in a buffer the compositor is still reading, which is
 invisible in practice for a full screen dim.
 
+### Damage
+
+Writes are confined to a damage region, and the region has to include everything
+that changed - including things drawn *outside* the selection, like the size
+readout that follows the cursor. A repaint that forgets one leaves a stale pill
+on screen until the next pointer event, so `updateSelection` unions in the rect
+the readout occupied last frame as well as the one it occupies now.
+
 ## Develop
 
 ```sh
@@ -165,13 +174,16 @@ without booting a session. Handy when changing anything in `src/core`.
 
 `--dev-click X,Y` and `--dev-drag X,Y,W,H` drive a synthetic gesture through the
 same functions the pointer handlers call, so the two paths that need a mouse can
-be exercised (and photographed, with `--dev-hold MS`) from a script. They are a
-development aid for exactly the code that cannot be reached otherwise:
+be exercised (and photographed, with `--dev-hold MS`) from a script. `--dev-via
+X,Y` pauses at a mid point first, which is how the size readout gets tested while
+it is moving. They are a development aid for exactly the code that cannot be
+reached otherwise, and they ignore the real pointer while running so the gesture
+stays deterministic:
 
 ```sh
 # what a click copies
 hex-god-screenshot-master --dev-click 900,300 && wl-paste
-# photograph the selection box mid drag
+# photograph the selection box and its size readout mid drag
 hex-god-screenshot-master --dev-drag 600,400,400,300 --dev-hold 4000 &
 sleep 1.5 && grim /tmp/box.png
 ```
@@ -213,12 +225,14 @@ checked against `grim` and `wl-paste` on the same screen:
   by `zig build preview`, which needs no compositor.
 - the click path copies the right colour: `--dev-click 900,300` prints `#656B75`,
   puts `#656B75` on the clipboard and `grim -g "900,300 1x1"` agrees.
-- the drag path draws its box: photographed mid gesture with `--dev-drag
-  600,400,400,300 --dev-hold 4000`, all four edges are a white 1-2px line at the
-  selection, every sampled interior pixel is undimmed against a pre-overlay
-  grab, every sampled exterior pixel is dimmed, and the size badge is drawn next
-  to the cursor. The screenshot that lands on the clipboard is 500x375 for that
-  logical 400x300 selection, and matches a `grim` grab of the same region.
+- the drag path draws its box and its size readout: photographed mid gesture,
+  all four edges are a white 1-2px line at the selection, every sampled interior
+  pixel is undimmed against a pre-overlay grab, every sampled exterior pixel is
+  dimmed, and the `W × H px` pill beside the cursor decodes glyph by glyph to
+  `500×375 px` (1800/1800 sampled pixels). Moving the cursor mid drag redraws the
+  pill at the new corner and leaves nothing behind at the old one. The screenshot
+  that lands on the clipboard is 500x375 for that logical 400x300 selection, and
+  matches a `grim` grab of the same region.
 
 Not exercised here: Escape and right-click cancel (no way to inject keys or
 buttons without another client on this box - the keyboard is grabbed exclusively
@@ -229,7 +243,10 @@ Three bugs found by exercising the two paths above, all fixed: the selection was
 never grown out of the zero sized rectangle `begin` creates (so no box was ever
 drawn, on either frontend), the clipboard payload pointed at the stack frame of
 the function that produced it (so a click copied garbage), and commits were
-gated on `wl_buffer.release`, which stalls forever on Hyprland.
+gated on `wl_buffer.release`, which stalls forever on Hyprland. A fourth bug hit
+the size readout the moment it was refactored out of the renderer: its `label()`
+took `self` by value and returned a slice into that parameter, so the text drew
+as nothing while the pill around it drew fine.
 
 ### macOS
 
