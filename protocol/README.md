@@ -1,13 +1,14 @@
-# Vendored Wayland protocol bindings
+# vendored wayland protocol bindings
 
 `src/linux` talks to the compositor through libwayland directly (see
 `src/linux/wl.zig`), so it needs the client-side glue that `wayland-scanner`
-normally generates. Those files are committed here so that building needs no
-scanner, no headers and no XML — only `libwayland-client.so` and
-`libxkbcommon.so` at compile and run time.
+normally generates. those files are committed here so that building needs no
+scanner, no headers and no xml - only `libwayland-client.so` and
+`libxkbcommon.so` at compile and run time
 
 `xml/` holds the protocol descriptions; `generated/` holds what
-`wayland-scanner` produced from them.
+`wayland-scanner` produced from them
+
 
 | protocol | why |
 | --- | --- |
@@ -17,7 +18,8 @@ scanner, no headers and no XML — only `libwayland-client.so` and
 | `viewporter` | mapping a 1:1 physical buffer onto a fractional-scaled output |
 | `xdg-shell` | pulled in by layer-shell: its `get_popup` request references `xdg_popup` |
 
-## Regenerating
+
+## regenerating
 
 ```sh
 # from the repository root
@@ -29,10 +31,10 @@ for name in xdg-shell xdg-output-unstable-v1 viewporter \
 done
 ```
 
-Sources:
+sources:
 
 * `wlr-*` from <https://gitlab.freedesktop.org/wlroots/wlr-protocols>
 * `xdg-*` and `viewporter` from `wayland-protocols` (`/usr/share/wayland-protocols`)
 
 `wl_registry`, `wl_compositor`, `wl_surface` and friends come from
-libwayland-client itself and are declared by hand in `src/linux/wl.zig`.
+libwayland-client itself and are declared by hand in `src/linux/wl.zig`

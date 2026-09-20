@@ -80,7 +80,7 @@ pub const ShmBuffer = struct {
         const size = @as(u64, stride) * height;
         if (size == 0 or size > std.math.maxInt(i32)) return error.TooLarge;
 
-        const fd = try std.posix.memfd_create("hex-god-screenshot-master", std.posix.MFD.CLOEXEC);
+        const fd = try std.posix.memfd_create("hgsm", std.posix.MFD.CLOEXEC);
         errdefer sys.closeFd(fd);
         try sys.truncateFd(fd, size);
 

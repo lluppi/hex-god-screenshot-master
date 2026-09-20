@@ -31,7 +31,7 @@ const Rect = geom.Rect;
 const Point = geom.Point;
 const FRect = geom.FRect;
 
-const namespace = "hex-god-screenshot-master";
+const namespace = "hgsm";
 
 const btn_left: u32 = 0x110;
 const btn_right: u32 = 0x111;
@@ -225,6 +225,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
         .options => |parsed| parsed,
         .help => {
             cli.printUsage();
+            return;
+        },
+        .version => {
+            cli.printVersion();
             return;
         },
         .invalid => {

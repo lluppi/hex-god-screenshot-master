@@ -1,6 +1,6 @@
 //! Bitmap text for the loupe badge and the dimension badge.
 //!
-//! The glyph masks in `font_data.zig` are baked by `tools/gen-font.py` at
+//! The glyph masks in `font_data.zig` are baked by `scripts/gen-font.py` at
 //! `supersample` times the cell size they are drawn at. Drawing box filters the
 //! mask down to the requested size, so every stroke gets a proportional
 //! anti-aliased edge. Scaling a 1x ink mask with nearest neighbour - what this

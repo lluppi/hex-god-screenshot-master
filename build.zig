@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "hex-god-screenshot-master",
+        .name = "hgsm",
         .root_module = module,
     });
 
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
         },
         else => {
             std.debug.print(
-                "hex-god-screenshot-master supports linux (wayland) and macos; target is {s}\n",
+                "hgsm supports linux (wayland) and macos; target is {s}\n",
                 .{@tagName(os_tag)},
             );
             @panic("unsupported target");

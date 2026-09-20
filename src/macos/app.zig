@@ -87,6 +87,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             cli.printUsage();
             return;
         },
+        .version => {
+            cli.printVersion();
+            return;
+        },
         .invalid => {
             cli.printUsage();
             std.process.exit(2);

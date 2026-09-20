@@ -5,6 +5,10 @@ const std = @import("std");
 const geom = @import("geom.zig");
 const out = @import("out.zig");
 
+/// Single source of truth for the version: the macOS installer reads this line
+/// out of the source to fill CFBundleShortVersionString.
+pub const version = "0.2.0";
+
 pub const Mode = enum { interactive, pick, shot, info };
 
 pub const Options = struct {
@@ -16,6 +20,7 @@ pub const Options = struct {
 pub const Result = union(enum) {
     options: Options,
     help,
+    version,
     invalid,
 };
 
@@ -39,6 +44,8 @@ pub fn parse(args: []const []const u8) Result {
             options.mode = .info;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return .help;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            return .version;
         } else {
             return invalid("unknown argument");
         }
@@ -69,14 +76,20 @@ pub fn parseRect(value: []const u8) ?geom.FRect {
     return .{ .x = x, .y = y, .w = w, .h = h };
 }
 
+pub fn printVersion() void {
+    out.print("hgsm {s}\n", .{version});
+}
+
 pub fn printUsage() void {
     out.print(
-        \\usage: hex-god-screenshot-master [option]
+        \\usage: hgsm [option]
         \\
         \\  (no option)          overlay: hover to inspect, click for hex, drag for a screenshot
         \\  --pick X,Y           print and copy the hex of a pixel, in logical coordinates
         \\  --shot X,Y,W,H       copy a logical rectangle as a PNG screenshot
         \\  --info               print the displays and their scales
+        \\  --version            print the version
+        \\  --help, -h           print this
         \\
         \\ Development: drive a synthetic gesture through the real handlers,
         \\ so the click and drag paths can be exercised from a script.

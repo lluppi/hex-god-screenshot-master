@@ -7,7 +7,7 @@ const sys = @import("sys.zig");
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buffer: [1024]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, fmt, args) catch {
-        std.debug.print("hex-god-screenshot-master: output truncated\n", .{});
+        std.debug.print("hgsm: output truncated\n", .{});
         return;
     };
     sys.writeAll(1, text);
@@ -16,7 +16,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 pub fn fail(comptime fmt: []const u8, args: anytype) void {
     var buffer: [1024]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, fmt, args) catch {
-        std.debug.print("hex-god-screenshot-master: output truncated\n", .{});
+        std.debug.print("hgsm: output truncated\n", .{});
         return;
     };
     sys.writeAll(2, text);
