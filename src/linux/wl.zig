@@ -11,6 +11,7 @@
 //! generated C in protocol/generated.
 
 const std = @import("std");
+const geom = @import("../core/geom.zig");
 
 /// Every wayland object is passed around as an opaque proxy pointer.
 pub const Obj = anyopaque;
@@ -28,11 +29,9 @@ pub const Interface = extern struct {
 pub const Argument = extern union {
     i: i32,
     u: u32,
-    f: i32,
     s: ?[*:0]const u8,
     o: ?*Obj,
     n: u32,
-    a: ?*anyopaque,
     h: i32,
 };
 
@@ -46,9 +45,7 @@ pub extern fn wl_display_roundtrip(display: *Obj) c_int;
 pub extern fn wl_display_flush(display: *Obj) c_int;
 pub extern fn wl_display_get_fd(display: *Obj) c_int;
 pub extern fn wl_display_get_registry(display: *Obj) ?*Obj;
-pub extern fn wl_display_get_serial(display: *Obj) u32;
 pub extern fn wl_proxy_get_version(proxy: *Obj) u32;
-pub extern fn wl_proxy_destroy(proxy: *Obj) void;
 pub extern fn wl_proxy_add_listener(
     proxy: *Obj,
     implementation: [*]const ?*const fn () callconv(.c) void,
@@ -64,7 +61,6 @@ pub extern fn wl_proxy_marshal_array_flags(
 ) ?*Obj;
 
 pub extern const wl_registry_interface: Interface;
-pub extern const wl_callback_interface: Interface;
 pub extern const wl_compositor_interface: Interface;
 pub extern const wl_shm_interface: Interface;
 pub extern const wl_shm_pool_interface: Interface;
@@ -76,7 +72,6 @@ pub extern const wl_keyboard_interface: Interface;
 pub extern const wl_data_device_manager_interface: Interface;
 pub extern const wl_data_device_interface: Interface;
 pub extern const wl_data_source_interface: Interface;
-pub extern const wl_data_offer_interface: Interface;
 pub extern const wl_output_interface: Interface;
 
 pub extern const zwlr_layer_shell_v1_interface: Interface;
@@ -89,6 +84,7 @@ pub extern const wp_viewporter_interface: Interface;
 pub extern const wp_viewport_interface: Interface;
 
 pub const shm_format_argb8888: u32 = 0;
+pub const shm_format_xrgb8888: u32 = 1;
 pub const button_released: u32 = 0;
 pub const button_pressed: u32 = 1;
 pub const seat_capability_pointer: u32 = 1;
@@ -154,7 +150,6 @@ pub fn requestDestroy(proxy: *Obj, opcode: u32, args: []const Argument) void {
     );
 }
 
-pub const NIL: ?*Obj = null;
 /// Writable: libwayland writes marshalled ids back into the array.
 pub var no_args = [_]Argument{};
 
@@ -229,6 +224,18 @@ pub fn surfaceDamage(surface: *Obj, x: i32, y: i32, width: i32, height: i32) voi
         .{ .i = height },
     };
     request(surface, 2, &args);
+}
+
+/// Damage in surface-local *buffer* pixels: the units the overlay works in, so
+/// it never has to reason about the surface's own coordinate space.
+pub fn surfaceDamageBuffer(surface: *Obj, rect: geom.Rect) void {
+    var args = [_]Argument{
+        .{ .i = rect.x },
+        .{ .i = rect.y },
+        .{ .i = rect.w },
+        .{ .i = rect.h },
+    };
+    request(surface, 9, &args);
 }
 
 pub fn surfaceSetBufferScale(surface: *Obj, scale: i32) void {

@@ -52,7 +52,7 @@ pub fn renderRegion(canvas: *Canvas, scene: Scene, region: Rect) void {
 
 fn paintBaseline(canvas: *Canvas, scene: Scene, region: Rect) void {
     canvas.copyFrom(scene.baseline.*, region);
-    canvas.dim(region, color.dim_numerator);
+    canvas.dim(region);
 }
 
 fn paintSelection(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) void {
@@ -61,8 +61,7 @@ fn paintSelection(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) 
     // be captured.
     canvas.copyFrom(scene.baseline.*, selection.intersection(region));
     paintSizeBadge(canvas, scene, selection, region);
-    const edge: i32 = @max(1, @as(i32, @intFromFloat(@round(scene.ui_scale))));
-    paintDifferenceFrame(canvas, selection, region, edge);
+    paintDifferenceFrame(canvas, selection, region, geom.px(scene.ui_scale, 1));
 }
 
 fn paintDifferenceFrame(canvas: *Canvas, rect: Rect, region: Rect, thickness: i32) void {
@@ -93,37 +92,41 @@ fn paintDifferenceRect(canvas: *Canvas, rect: Rect) void {
     }
 }
 
+/// luma is 0..255000, so mid grey is half that. Around mid grey an inverted
+/// colour barely moves, which is the one band where the difference edge needs a
+/// higher-contrast neutral instead.
+const luma_mid = 127_500;
+const luma_full = 255_000;
+const luma_dead_zone = 64_000;
+
+/// The dimensions readout is drawn a touch smaller than the loupe's, so it reads
+/// as a secondary instrument.
+const readout_scale_factor: f64 = 0.85;
+
+/// Where the floating fallback plate sits relative to the cursor, and how close
+/// it may come to the screen edge, in points.
+const fallback_offset_pt: f64 = 8;
+const fallback_margin_pt: f64 = 8;
+
 fn differenceInk(pixel: u32) u32 {
     const rgb = color.rgbOf(pixel);
-    const luma = @as(u32, rgb.r) * 299 + @as(u32, rgb.g) * 587 + @as(u32, rgb.b) * 114;
-    const inverse_delta = if (luma >= 127_500) 2 * luma - 255_000 else 255_000 - 2 * luma;
+    const luma = color.luma(rgb);
+    const inverse_delta = if (luma >= luma_mid) 2 * luma - luma_full else luma_full - 2 * luma;
 
-    // Mid-greys barely move when inverted, so snap only that dead zone to the
-    // higher-contrast neutral. Everywhere else keeps a true difference colour.
-    if (inverse_delta < 64_000) {
-        return if (luma >= 127_500)
-            color.solid(.{ .r = 0x00, .g = 0x00, .b = 0x00 })
-        else
-            color.solid(.{ .r = 0xff, .g = 0xff, .b = 0xff });
+    if (inverse_delta < luma_dead_zone) {
+        return color.solid(if (luma >= luma_mid) color.black_rgb else color.white);
     }
     return color.solid(.{ .r = 0xff - rgb.r, .g = 0xff - rgb.g, .b = 0xff - rgb.b });
 }
 
-/// The endpoint instrument: dimensions plus an optional external pixel scope.
+/// The endpoint instrument's geometry: where the dimensions plate goes, and the
+/// external pixel scope attached to the active corner when it fits.
 pub const SizeBadge = struct {
     rect: Rect,
+    text_scale: f64 = 1,
     scope: ?Rect = null,
     scope_column: u32 = 0,
     scope_row: u32 = 0,
-    text_scale: f64 = 1,
-    text: [32]u8,
-    len: usize,
-
-    /// Borrow the label. Takes a pointer on purpose: a by-value receiver would
-    /// return a slice into a parameter that dies with the call.
-    pub fn label(self: *const SizeBadge) []const u8 {
-        return self.text[0..self.len];
-    }
 
     pub fn bounds(self: *const SizeBadge) Rect {
         return if (self.scope) |scope|
@@ -145,13 +148,8 @@ pub fn sizeBadge(
     if (selection.w < 2 and selection.h < 2) return null;
 
     var text_buffer: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(
-        &text_buffer,
-        "{d}\xd7{d}",
-        .{ selection.w, selection.h },
-    ) catch return null;
-
-    const readout_scale = ui_scale * 0.85;
+    const text = std.fmt.bufPrint(&text_buffer, "{d}\xd7{d}", .{ selection.w, selection.h }) catch return null;
+    const readout_scale = ui_scale * readout_scale_factor;
     const metrics = badge_mod.metrics(text, readout_scale);
     const scope_side: i32 = @intFromFloat(@round(magnifier.endpoint_scope_size * ui_scale));
     const anchor_x: i32 = @intFromFloat(@floor(cursor.x));
@@ -185,7 +183,7 @@ pub fn sizeBadge(
     var text_scale = readout_scale;
     if (cluster_fits) {
         badge_rect = attached_badge;
-        const inset: i32 = @max(1, @as(i32, @intFromFloat(@round(2 * readout_scale))));
+        const inset = geom.px(readout_scale, 2);
         const available = @max(1, attached_badge.w - 2 * inset);
         const text_width = @max(1, metrics.width - 2 * metrics.padding_x);
         if (text_width > available) {
@@ -200,8 +198,8 @@ pub fn sizeBadge(
         scope_column = if (active_right) 0 else magnifier.endpoint_sample_side - 1;
         scope_row = if (active_bottom) 0 else magnifier.endpoint_sample_side - 1;
     } else {
-        const offset: i32 = @intFromFloat(@round(8 * ui_scale));
-        const margin: i32 = @intFromFloat(@round(8 * ui_scale));
+        const offset: i32 = @intFromFloat(@round(fallback_offset_pt * ui_scale));
+        const margin: i32 = @intFromFloat(@round(fallback_margin_pt * ui_scale));
         badge_rect = .{
             .x = std.math.clamp(anchor_x + offset, margin, @max(margin, canvas.w - metrics.width - margin)),
             .y = std.math.clamp(anchor_y + offset, margin, @max(margin, canvas.h - metrics.height - margin)),
@@ -210,17 +208,13 @@ pub fn sizeBadge(
         };
     }
 
-    var badge = SizeBadge{
+    return .{
         .rect = badge_rect,
+        .text_scale = text_scale,
         .scope = scope_rect,
         .scope_column = scope_column,
         .scope_row = scope_row,
-        .text_scale = text_scale,
-        .text = undefined,
-        .len = text.len,
     };
-    @memcpy(badge.text[0..text.len], text);
-    return badge;
 }
 
 fn paintSizeBadge(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) void {
@@ -239,7 +233,9 @@ fn paintSizeBadge(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) 
             );
         }
     }
-    badge_mod.draw(canvas, endpoint.rect, endpoint.label(), endpoint.text_scale);
+    var text_buffer: [32]u8 = undefined;
+    const label = std.fmt.bufPrint(&text_buffer, "{d}\xd7{d}", .{ selection.w, selection.h }) catch return;
+    badge_mod.draw(canvas, endpoint.rect, label, endpoint.text_scale);
 }
 
 /// Draw the loupe on top of the overlay content.

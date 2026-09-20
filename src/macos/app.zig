@@ -10,6 +10,11 @@
 //! NOTE: this file cannot be compiled on Linux (no Apple SDK) and has not been
 //! run on macOS yet. It is written against the documented AppKit/CoreGraphics
 //! ABI: see src/macos/objc.zig for what is declared and why.
+//!
+//! Known parity gap: the pointer can only be in one display's window at a time,
+//! so there is no mouseExited handler and the loupe is never cleared when the
+//! cursor crosses between displays. The Wayland frontend drives
+//! `Interaction.leaveSurface` for that.
 
 const std = @import("std");
 const objc = @import("objc.zig");
@@ -17,7 +22,6 @@ const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
 const color = @import("../core/color.zig");
 const interaction_mod = @import("../core/interaction.zig");
-const sampling = @import("../core/sampling.zig");
 const png = @import("../core/png.zig");
 const cli = @import("../core/cli.zig");
 const sys = @import("../core/sys.zig");
@@ -46,24 +50,26 @@ const Display = struct {
     canvas: ?Canvas = null,
     window: id = null,
     view: id = null,
-
-    fn localLogical(self: *Display, global: Point) Point {
-        return .{ .x = global.x - self.logical.x, .y = global.y - self.logical.y };
-    }
 };
 
 const App = struct {
     allocator: std.mem.Allocator,
     displays: std.ArrayList(*Display) = .empty,
+    /// The displays as the shared interaction sees them, built once after the
+    /// baselines exist. Indexed by `interaction_id`.
+    surfaces: []interaction_mod.Surface = &.{},
     /// Bottom edge of the primary display in AppKit coordinates, used to flip
     /// between AppKit's y-up space and the core's y-down space.
     main_max_y: f64 = 0,
     interaction: ?interaction_mod.Interaction = null,
-    buttons: u32 = 0,
     finished: bool = false,
     exit_code: u8 = 0,
 };
 
+/// Set while the overlay is up, so the runtime-defined view and window callbacks
+/// (which receive no user data) can reach the app. It is the one piece of global
+/// state in this frontend: AppKit's delegate-less selector dispatch has nowhere
+/// else to put a context pointer.
 var current_app: ?*App = null;
 
 // ---------------------------------------------------------------------------
@@ -81,8 +87,8 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
     var rest: std.ArrayList([]const u8) = .empty;
     while (args.next()) |arg| try rest.append(allocator, arg);
 
-    const options = switch (cli.parse(rest.items)) {
-        .options => |parsed| parsed,
+    const invocation = switch (cli.parse(rest.items)) {
+        .run => |parsed| parsed,
         .help => {
             cli.printUsage();
             return;
@@ -91,11 +97,14 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             cli.printVersion();
             return;
         },
-        .invalid => {
+        .invalid => |message| {
+            out.fail("{s}\n", .{message});
             cli.printUsage();
             std.process.exit(2);
         },
     };
+    const command = invocation.command;
+    const dev = invocation.dev;
 
     var app = App{ .allocator = allocator };
 
@@ -118,12 +127,12 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
 
     try collectDisplays(&app);
     try captureBaselines(&app);
+    app.surfaces = try buildSurfaces(&app);
 
-    switch (options.mode) {
+    switch (command) {
         .info => printInfo(&app),
-        .pick => {
-            const point = options.pick.?;
-            const rgb = pickColor(&app, point) orelse {
+        .pick => |point| {
+            const rgb = interaction_mod.colorAt(app.surfaces, point) orelse {
                 out.fail("no display contains {d},{d}\n", .{ point.x, point.y });
                 std.process.exit(1);
             };
@@ -131,13 +140,20 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             out.print("{s}\n", .{hex});
             copyText(&hex);
         },
-        .shot => {
-            const canvas = try captureScreenshot(&app, options.shot.?);
+        .shot => |rect| {
+            const canvas = try captureScreenshot(&app, rect);
             const bytes = try png.encode(allocator, canvas);
             out.print("Screenshot copied to clipboard\n", .{});
             copyPng(bytes);
         },
         .interactive => {
+            switch (dev) {
+                .none => {},
+                else => {
+                    out.fail("synthetic gestures are linux-only\n", .{});
+                    std.process.exit(2);
+                },
+            }
             try startOverlay(&app);
             defer {
                 app.interaction.?.deinit();
@@ -179,7 +195,6 @@ fn collectDisplays(app: *App) !void {
     while (index < count) : (index += 1) {
         const screen = objc.msgSend(id, screens, objc.sel("objectAtIndex:"), .{index});
         const frame = objc.msgSend(objc.CGRect, screen, objc.sel("frame"), .{});
-        const scale = objc.msgSend(f64, screen, objc.sel("backingScaleFactor"), .{});
 
         const description = objc.msgSend(id, screen, objc.sel("deviceDescription"), .{});
         const number = objc.msgSend(id, description, objc.sel("objectForKey:"), .{number_key});
@@ -196,12 +211,17 @@ fn collectDisplays(app: *App) !void {
                 .w = frame.size.width,
                 .h = frame.size.height,
             },
-            .scale = if (scale > 0) scale else 1,
+            .scale = 1,
         };
         try app.displays.append(app.allocator, display);
     }
 }
 
+/// Grab every display once, before the overlay appears.
+///
+/// The scale is derived from the captured pixel size rather than AppKit's
+/// `backingScaleFactor`, so it is the scale of the pixels we actually sample and
+/// crop; it is the single source of truth for `Display.scale`.
 fn captureBaselines(app: *App) !void {
     for (app.displays.items) |display| {
         const image = objc.CGDisplayCreateImage(display.id) orelse {
@@ -215,6 +235,17 @@ fn captureBaselines(app: *App) !void {
             display.scale = @as(f64, @floatFromInt(baseline.width)) / display.logical.w;
         }
     }
+}
+
+/// The immutable per-display surfaces the shared interaction works in, built
+/// once after the baselines exist. `interaction_id` is the index.
+fn buildSurfaces(app: *App) ![]interaction_mod.Surface {
+    const surfaces = try app.allocator.alloc(interaction_mod.Surface, app.displays.items.len);
+    for (app.displays.items, 0..) |display, index| {
+        display.interaction_id = index;
+        surfaces[index] = .{ .logical = display.logical, .scale = display.scale, .baseline = &display.baseline.? };
+    }
+    return surfaces;
 }
 
 fn printInfo(app: *App) void {
@@ -382,18 +413,19 @@ fn displayForView(view: id) ?*Display {
 // Gesture
 // ---------------------------------------------------------------------------
 
-fn repaintDamages(app: *App, damages: []const interaction_mod.Damage) void {
-    for (damages) |damage| paintRegion(app.displays.items[damage.surface], damage.rect);
+/// Repaint one display's region. This is the frontend's whole implementation of
+/// the shared `PaintFn`.
+fn paintDisplay(ctx: *anyopaque, surface: interaction_mod.SurfaceId, region: Rect) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    paintRegion(app.displays.items[surface], region);
 }
 
 fn updateCursor(app: *App, display: *Display, local: Point) void {
-    const damages = app.interaction.?.moveCursor(display.interaction_id, local);
-    repaintDamages(app, damages);
+    interaction_mod.paintDamages(app.interaction.?.moveCursor(display.interaction_id, local), app, paintDisplay);
 }
 
 fn beginSelection(app: *App) void {
-    const damages = app.interaction.?.beginSelection();
-    repaintDamages(app, damages);
+    interaction_mod.paintDamages(app.interaction.?.beginSelection(), app, paintDisplay);
 }
 
 fn endSelection(app: *App) void {
@@ -412,7 +444,7 @@ fn finish(app: *App, result: interaction_mod.Result) void {
 
     switch (result) {
         .color => |point| {
-            const rgb = pickColor(app, point) orelse {
+            const rgb = interaction_mod.colorAt(app.surfaces, point) orelse {
                 out.fail("the pixel colour could not be read\n", .{});
                 app.exit_code = 1;
                 terminate();
@@ -427,12 +459,13 @@ fn finish(app: *App, result: interaction_mod.Result) void {
         .screenshot => |rect| {
             hideOverlays(app);
             sys.sleepMs(overlay_settle_ms);
-            const canvas = captureScreenshot(app, rect) catch |err| {
+            var canvas = captureScreenshot(app, rect) catch |err| {
                 out.fail("screenshot failed: {t}\n", .{err});
                 app.exit_code = 1;
                 terminate();
                 return;
             };
+            defer canvas.deinit();
             const bytes = png.encode(app.allocator, canvas) catch |err| {
                 out.fail("png encoding failed: {t}\n", .{err});
                 app.exit_code = 1;
@@ -451,85 +484,37 @@ fn terminate() void {
     objc.msgSend(void, application, objc.sel("terminate:"), .{@as(id, null)});
 }
 
-fn pickColor(app: *App, global: Point) ?color.Rgb {
-    for (app.displays.items) |display| {
-        const baseline = display.baseline orelse continue;
-        const local = display.localLogical(global);
-        if (local.x < 0 or local.y < 0) continue;
-        if (local.x >= display.logical.w or local.y >= display.logical.h) continue;
-        return sampling.sampleHex(&baseline, display.scale, local);
-    }
-    return null;
-}
-
-/// Capture a global logical rectangle.
-///
-/// A rectangle that sits on one display keeps the captured pixels exactly as
-/// CoreGraphics produced them; only a selection spanning displays needs a
-/// composed image in a common pixel grid.
+/// Capture a global logical rectangle. The composition and the single-display
+/// shortcut both live in the shared interaction; this only supplies the
+/// per-display capture.
 fn captureScreenshot(app: *App, rect: FRect) !Canvas {
-    var single: ?*Display = null;
-    var count: usize = 0;
-    for (app.displays.items) |display| {
-        if (rect.intersection(display.logical).isEmpty()) continue;
-        single = display;
-        count += 1;
-    }
-    if (count == 1) {
-        const display = single.?;
-        const intersection = rect.intersection(display.logical);
-        const image = try captureDisplayRegion(display, intersection);
-        defer objc.CGImageRelease(image);
-        return canvasFromImage(app.allocator, image);
-    }
-
-    var scale: f64 = 1;
-    for (app.displays.items) |display| scale = @max(scale, display.scale);
-
-    const width: u32 = @intFromFloat(@max(1, @round(rect.w * scale)));
-    const height: u32 = @intFromFloat(@max(1, @round(rect.h * scale)));
-    var composite = try Canvas.init(app.allocator, width, height);
-    errdefer composite.deinit();
-
-    for (app.displays.items) |display| {
-        const intersection = rect.intersection(display.logical);
-        if (intersection.isEmpty()) continue;
-        const image = try captureDisplayRegion(display, intersection);
-        defer objc.CGImageRelease(image);
-
-        var captured = try canvasFromImage(app.allocator, image);
-        const destination = Rect.roundF(.{
-            .x = (intersection.x - rect.x) * scale,
-            .y = (intersection.y - rect.y) * scale,
-            .w = intersection.w * scale,
-            .h = intersection.h * scale,
-        });
-        composite.blitNearest(captured, destination);
-        captured.deinit();
-    }
-    return composite;
+    return interaction_mod.captureScreenshot(app.allocator, app.surfaces, rect, app, captureOne);
 }
 
-fn captureDisplayRegion(display: *Display, intersection: FRect) !objc.CGImageRef {
-    const local = display.localLogical(.{ .x = intersection.x, .y = intersection.y });
-    // CGDisplayCreateImageForRect takes display-local points, y down.
-    const request = objc.CGRect.make(local.x, local.y, intersection.w, intersection.h);
-    return objc.CGDisplayCreateImageForRect(display.id, request) orelse {
+/// Capture one display's share of a screenshot. `intersection` is in global
+/// logical coordinates; CGDisplayCreateImageForRect wants display-local points,
+/// y down.
+fn captureOne(app: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
+    const display = app.displays.items[surface];
+    const request = objc.CGRect.make(
+        intersection.x - display.logical.x,
+        intersection.y - display.logical.y,
+        intersection.w,
+        intersection.h,
+    );
+    const image = objc.CGDisplayCreateImageForRect(display.id, request) orelse {
         out.fail("could not capture display {d}\n", .{display.id});
         return error.CaptureFailed;
     };
+    defer objc.CGImageRelease(image);
+    return canvasFromImage(app.allocator, image);
 }
 
 fn updateHoverFromMouse(app: *App) void {
     const location = objc.msgSend(objc.CGPoint, objc.class("NSEvent"), objc.sel("mouseLocation"), .{});
     const global = Point{ .x = location.x, .y = app.main_max_y - location.y };
-    for (app.displays.items) |display| {
-        const local = display.localLogical(global);
-        if (local.x < 0 or local.y < 0) continue;
-        if (local.x >= display.logical.w or local.y >= display.logical.h) continue;
-        updateCursor(app, display, local);
-        return;
-    }
+    const hit = interaction_mod.hitTest(app.surfaces, global) orelse return;
+    updateCursor(app, app.displays.items[hit.surface], hit.local);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +578,6 @@ fn viewClass() objc.Class {
             .{ .name = "mouseUp:", .imp = @ptrCast(&viewMouseUp), .types = "v@:@" },
             .{ .name = "rightMouseDown:", .imp = @ptrCast(&viewRightMouseDown), .types = "v@:@" },
             .{ .name = "keyDown:", .imp = @ptrCast(&viewKeyDown), .types = "v@:@" },
-            .{ .name = "resetCursorRects", .imp = @ptrCast(&viewResetCursorRects), .types = "v@:" },
         };
     };
     const Cache = struct {
@@ -694,12 +678,6 @@ fn viewAcceptsFirstMouse(self: id, cmd: SEL, event: id) callconv(.c) bool {
     return true;
 }
 
-fn viewResetCursorRects(self: id, cmd: SEL) callconv(.c) void {
-    _ = self;
-    _ = cmd;
-    // The native cursor stays hidden while the overlay owns the pointer.
-}
-
 fn windowCanBecomeKey(self: id, cmd: SEL) callconv(.c) bool {
     _ = self;
     _ = cmd;
@@ -713,9 +691,8 @@ fn windowCanBecomeMain(self: id, cmd: SEL) callconv(.c) bool {
 }
 
 /// View-local point, y down, from an AppKit mouse event.
-fn viewPoint(view: id, display: *Display, event: id) Point {
+fn viewPoint(display: *Display, event: id) Point {
     const window_point = objc.msgSend(objc.CGPoint, event, objc.sel("locationInWindow"), .{});
-    _ = view;
     // The view is not flipped, so the window's y grows upwards.
     return .{ .x = window_point.x, .y = display.logical.h - window_point.y };
 }
@@ -724,15 +701,14 @@ fn viewMouseMoved(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    updateCursor(app, display, viewPoint(self, display, event));
+    updateCursor(app, display, viewPoint(display, event));
 }
 
 fn viewMouseDown(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    app.buttons += 1;
-    updateCursor(app, display, viewPoint(self, display, event));
+    updateCursor(app, display, viewPoint(display, event));
     beginSelection(app);
 }
 
@@ -740,15 +716,14 @@ fn viewMouseDragged(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    updateCursor(app, display, viewPoint(self, display, event));
+    updateCursor(app, display, viewPoint(display, event));
 }
 
 fn viewMouseUp(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    if (app.buttons > 0) app.buttons -= 1;
-    updateCursor(app, display, viewPoint(self, display, event));
+    updateCursor(app, display, viewPoint(display, event));
     if (app.interaction.?.isSelecting()) endSelection(app);
 }
 

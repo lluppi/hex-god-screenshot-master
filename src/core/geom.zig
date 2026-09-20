@@ -11,6 +11,22 @@
 
 const std = @import("std");
 
+/// A length in points, scaled to physical pixels and never less than one pixel.
+pub fn px(scale: f64, points: f64) i32 {
+    return @max(1, @as(i32, @intFromFloat(@round(points * scale))));
+}
+
+/// Overlap of two rectangles of the same numeric type; empty when they do not
+/// touch. Shared by `Rect` and `FRect` so one definition serves both spaces.
+fn intersect(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.maxX(), b.maxX());
+    const y1 = @min(a.maxY(), b.maxY());
+    if (x1 <= x0 or y1 <= y0) return .{};
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
 pub const Point = struct {
     x: f64 = 0,
     y: f64 = 0,
@@ -43,12 +59,7 @@ pub const FRect = struct {
     }
 
     pub fn intersection(self: FRect, other: FRect) FRect {
-        const x0 = @max(self.x, other.x);
-        const y0 = @max(self.y, other.y);
-        const x1 = @min(self.maxX(), other.maxX());
-        const y1 = @min(self.maxY(), other.maxY());
-        if (x1 <= x0 or y1 <= y0) return .{};
-        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        return intersect(self, other);
     }
 
     /// Normalised rectangle from two corner points, in any order.
@@ -86,12 +97,7 @@ pub const Rect = struct {
     }
 
     pub fn intersection(self: Rect, other: Rect) Rect {
-        const x0 = @max(self.x, other.x);
-        const y0 = @max(self.y, other.y);
-        const x1 = @min(self.maxX(), other.maxX());
-        const y1 = @min(self.maxY(), other.maxY());
-        if (x1 <= x0 or y1 <= y0) return .{};
-        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        return intersect(self, other);
     }
 
     pub fn unionWith(self: Rect, other: Rect) Rect {
@@ -104,17 +110,13 @@ pub const Rect = struct {
         return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
     }
 
-    pub fn inset(self: Rect, dx: i32, dy: i32) Rect {
-        return .{
-            .x = self.x + dx,
-            .y = self.y + dy,
-            .w = self.w - 2 * dx,
-            .h = self.h - 2 * dy,
-        };
-    }
-
     pub fn expand(self: Rect, amount: i32) Rect {
-        return self.inset(-amount, -amount);
+        return .{
+            .x = self.x - amount,
+            .y = self.y - amount,
+            .w = self.w + 2 * amount,
+            .h = self.h + 2 * amount,
+        };
     }
 
     pub fn contains(self: Rect, x: i32, y: i32) bool {

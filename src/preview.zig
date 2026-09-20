@@ -54,9 +54,9 @@ pub fn main(init: std.process.Init) !void {
             );
         }
     }
-    baseline.fillRect(.{ .x = 120, .y = 90, .w = 160, .h = 90 }, color.solid(.{ .r = 0x1d, .g = 0x4e, .b = 0xd8 }));
-    baseline.fillRect(.{ .x = 420, .y = 200, .w = 120, .h = 120 }, color.solid(.{ .r = 0x16, .g = 0xa3, .b = 0x4a }));
-    baseline.fillRect(.{ .x = 620, .y = 420, .w = 200, .h = 60 }, color.solid(.{ .r = 0xf5, .g = 0x9e, .b = 0x0b }));
+    baseline.fill(.{ .x = 120, .y = 90, .w = 160, .h = 90 }, color.solid(.{ .r = 0x1d, .g = 0x4e, .b = 0xd8 }));
+    baseline.fill(.{ .x = 420, .y = 200, .w = 120, .h = 120 }, color.solid(.{ .r = 0x16, .g = 0xa3, .b = 0x4a }));
+    baseline.fill(.{ .x = 620, .y = 420, .w = 200, .h = 60 }, color.solid(.{ .r = 0xf5, .g = 0x9e, .b = 0x0b }));
 
     var frame = try canvas_mod.Canvas.init(allocator, width, height);
     defer frame.deinit();
@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
 
     var sample = try canvas_mod.Canvas.init(allocator, magnifier.sample_side, magnifier.sample_side);
     defer sample.deinit();
-    sampling.fillSample(&sample, &baseline, 1, cursor);
+    sampling.fillSample(&sample, &baseline, cursor);
 
     overlay.renderRegion(&frame, .{
         .baseline = &baseline,
@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     const hover_cursor = geom.Point{ .x = 730, .y = 150 };
     var hover_sample = try canvas_mod.Canvas.init(allocator, magnifier.sample_side, magnifier.sample_side);
     defer hover_sample.deinit();
-    sampling.fillSample(&hover_sample, &baseline, 1, hover_cursor);
+    sampling.fillSample(&hover_sample, &baseline, hover_cursor);
     overlay.renderMagnifier(&frame, magnifier.windowOrigin(hover_cursor, ui_scale), hover_sample, ui_scale);
 
     const bytes = try png.encode(allocator, frame);

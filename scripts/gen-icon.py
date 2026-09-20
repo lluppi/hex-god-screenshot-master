@@ -19,7 +19,6 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 ICNS = ROOT / "assets" / "icon" / "icon.icns"
-PREVIEW = ROOT / "assets" / "icon" / "icon.png"
 
 SIZE = 1024
 SUPERSAMPLE = 4
@@ -130,9 +129,7 @@ def main() -> None:
     ]
     ICNS.parent.mkdir(parents=True, exist_ok=True)
     ICNS.write_bytes(icns(entries))
-    PREVIEW.write_bytes(png(icon))
     print(f"{ICNS.relative_to(ROOT)}  {ICNS.stat().st_size} bytes")
-    print(f"{PREVIEW.relative_to(ROOT)}  {PREVIEW.stat().st_size} bytes")
 
 
 if __name__ == "__main__":

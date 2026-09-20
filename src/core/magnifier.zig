@@ -26,6 +26,13 @@ pub const cursor_inset: f64 = scope_size / 2;
 /// centre pixel: that is both the target and the colour copied on click.
 pub const sample_side: u32 = 13;
 
+/// The faint lines between sample cells.
+const grid_ink: u32 = @as(u32, 48) << 24;
+
+fn gridWidth(ui_scale: f64) i32 {
+    return geom.px(ui_scale, 1);
+}
+
 /// Top-left corner of the scope window for a cursor at `point`.
 pub fn windowOrigin(cursor: geom.Point, ui_scale: f64) geom.Point {
     return .{
@@ -52,23 +59,11 @@ pub fn windowRect(origin: geom.Point, ui_scale: f64) Rect {
     };
 }
 
-/// First destination pixel at or beyond a sample-cell boundary.
-fn gridOffset(step: u32, size: i32) i32 {
+/// First destination pixel at or beyond a boundary between `cells` equal cells
+/// spanning `size` pixels.
+fn gridOffset(step: u32, size: i32, cells: u32) i32 {
     const scaled = @as(u64, step) * @as(u64, @intCast(size));
-    return @intCast((scaled + sample_side - 1) / sample_side);
-}
-
-fn endpointGridOffset(step: u32, size: i32) i32 {
-    const scaled = @as(u64, step) * @as(u64, @intCast(size));
-    return @intCast((scaled + endpoint_sample_side - 1) / endpoint_sample_side);
-}
-
-fn targetInk(rgb: color.Rgb) u32 {
-    const perceived_light = @as(u32, rgb.r) * 299 + @as(u32, rgb.g) * 587 + @as(u32, rgb.b) * 114;
-    return if (perceived_light >= 128_000)
-        color.solid(.{ .r = 0x00, .g = 0x00, .b = 0x00 })
-    else
-        color.solid(.{ .r = 0xff, .g = 0xff, .b = 0xff });
+    return @intCast((scaled + cells - 1) / cells);
 }
 
 fn blendFrame(canvas: *Canvas, rect: Rect, thickness: i32, pixel: u32) void {
@@ -98,56 +93,77 @@ pub fn render(canvas: *Canvas, origin: geom.Point, sample: Canvas, ui_scale: f64
 
     const side: i32 = @intFromFloat(@round(scope_size * ui_scale));
     const scope = Rect{ .x = window.x, .y = window.y, .w = side, .h = side };
-    canvas.blitNearest(sample, scope);
+    const line = gridWidth(ui_scale);
+    renderGrid(canvas, scope, sample, line, geom.px(ui_scale, 2));
+    renderTarget(canvas, scope, sample, line);
+    renderPlate(canvas, window, side, sample, ui_scale);
+}
 
-    const grid_ink = color.black(48);
-    const grid_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
+/// The magnified sample, its cell grid, and the structural outer rail.
+fn renderGrid(canvas: *Canvas, scope: Rect, sample: Canvas, line: i32, rail: i32) void {
+    canvas.blitNearest(sample, sample.rect(), scope);
+
     var step: u32 = 1;
     while (step < sample_side) : (step += 1) {
-        const offset = gridOffset(step, side);
-        canvas.blendRect(.{ .x = scope.x + offset, .y = scope.y, .w = grid_width, .h = scope.h }, grid_ink);
-        canvas.blendRect(.{ .x = scope.x, .y = scope.y + offset, .w = scope.w, .h = grid_width }, grid_ink);
+        const offset = gridOffset(step, scope.w, sample_side);
+        canvas.blendRect(.{ .x = scope.x + offset, .y = scope.y, .w = line, .h = scope.h }, grid_ink);
+        canvas.blendRect(.{ .x = scope.x, .y = scope.y + offset, .w = scope.w, .h = line }, grid_ink);
     }
 
     // The outer rail is structural; its inner edge is exactly one grid line.
-    const light = color.solid(.{ .r = 0xee, .g = 0xec, .b = 0xed });
-    const outer_light: i32 = @max(1, @as(i32, @intFromFloat(@round(2 * ui_scale))));
-    canvas.strokeRect(scope, outer_light, light);
+    canvas.strokeRect(scope, rail, color.solid(color.instrument_light));
     blendFrame(
         canvas,
         .{
-            .x = scope.x + outer_light,
-            .y = scope.y + outer_light,
-            .w = scope.w - 2 * outer_light,
-            .h = scope.h - 2 * outer_light,
+            .x = scope.x + rail,
+            .y = scope.y + rail,
+            .w = scope.w - 2 * rail,
+            .h = scope.h - 2 * rail,
         },
-        grid_width,
+        line,
         grid_ink,
     );
+}
 
+/// The outline around the cell that will be copied on click.
+fn renderTarget(canvas: *Canvas, scope: Rect, sample: Canvas, line: i32) void {
     const rgb = hexAt(sample) orelse return;
     const centre = sample_side / 2;
-    const target_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
-    const target_start = gridOffset(centre, side);
-    const target_end = gridOffset(centre + 1, side);
-    const target = Rect{
-        .x = scope.x + target_start,
-        .y = scope.y + target_start,
-        // Include the far grid line so every edge replaces a line instead of
-        // consuming space inside the hovered pixel.
-        .w = target_end - target_start + target_width,
-        .h = target_end - target_start + target_width,
-    };
-    canvas.strokeRect(target, target_width, targetInk(rgb));
+    const start = gridOffset(centre, scope.w, sample_side);
+    const end = gridOffset(centre + 1, scope.w, sample_side);
+    canvas.strokeRect(
+        .{
+            .x = scope.x + start,
+            .y = scope.y + start,
+            // Include the far grid line so every edge replaces a line instead of
+            // consuming space inside the hovered pixel.
+            .w = end - start + line,
+            .h = end - start + line,
+        },
+        line,
+        color.solid(color.contrasting(rgb)),
+    );
+}
 
-    const text = color.hexString(rgb);
+/// The hex plate under the scope, with the sampled colour as its only chromatic
+/// accent. The plate is only as wide as the code itself (plus its own padding),
+/// centred under the scope, rather than spanning the scope's width: the code is
+/// the content, the plate just backs it.
+fn renderPlate(canvas: *Canvas, window: Rect, side: i32, sample: Canvas, ui_scale: f64) void {
+    const rgb = hexAt(sample) orelse return;
+    const hex = color.hexString(rgb);
+    const metrics = badge.metrics(&hex, ui_scale);
     const height: i32 = @intFromFloat(@round(plate_height * ui_scale));
-    const plate = Rect{ .x = window.x, .y = window.y + side, .w = side, .h = height };
-    badge.draw(canvas, plate, &text, ui_scale);
+    const plate = Rect{
+        .x = window.x + @divTrunc(window.w - metrics.width, 2),
+        .y = window.y + side,
+        .w = metrics.width,
+        .h = height,
+    };
+    badge.draw(canvas, plate, &hex, ui_scale);
 
-    // The sampled colour is the only chromatic accent in the instrument.
     const signal_height: i32 = @max(2, @as(i32, @intFromFloat(@round(3 * ui_scale))));
-    canvas.fillRect(
+    canvas.fill(
         .{ .x = plate.x, .y = plate.maxY() - signal_height, .w = plate.w, .h = signal_height },
         color.solid(rgb),
     );
@@ -195,92 +211,57 @@ pub fn renderEndpoint(
     const source_y: i32 = @as(i32, @intCast(sample.height / 2)) - @as(i32, @intCast(target_row));
     const outward_x: i32 = if (target_column == 0) 1 else -1;
     const outward_y: i32 = if (target_row == 0) 1 else -1;
+    const cells: i32 = @intCast(endpoint_sample_side);
 
     const horizontal = horizontalCompanion(rect, target_column);
     const vertical = verticalCompanion(rect, target_row);
-    renderEndpointTile(canvas, rect, sample, ui_scale, source_x, source_y);
-    renderEndpointTile(
-        canvas,
-        horizontal,
-        sample,
-        ui_scale,
-        source_x - outward_x * @as(i32, @intCast(endpoint_sample_side)),
-        source_y,
-    );
-    renderEndpointTile(
-        canvas,
-        vertical,
-        sample,
-        ui_scale,
-        source_x,
-        source_y - outward_y * @as(i32, @intCast(endpoint_sample_side)),
-    );
+    const line = gridWidth(ui_scale);
+    renderEndpointTile(canvas, rect, sample, line, source_x, source_y);
+    renderEndpointTile(canvas, horizontal, sample, line, source_x - outward_x * cells, source_y);
+    renderEndpointTile(canvas, vertical, sample, line, source_x, source_y - outward_y * cells);
 
-    const grid_ink = color.black(48);
-    const grid_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
-    blendFrame(canvas, rect, grid_width, grid_ink);
-    blendFrameEdges(
-        canvas,
-        horizontal,
-        grid_width,
-        grid_ink,
-        true,
-        true,
-        target_column == 0,
-        target_column != 0,
-    );
-    blendFrameEdges(
-        canvas,
-        vertical,
-        grid_width,
-        grid_ink,
-        target_row == 0,
-        target_row != 0,
-        true,
-        true,
-    );
+    blendFrame(canvas, rect, line, grid_ink);
+    blendFrameEdges(canvas, horizontal, line, grid_ink, true, true, target_column == 0, target_column != 0);
+    blendFrameEdges(canvas, vertical, line, grid_ink, target_row == 0, target_row != 0, true, true);
 
     const rgb = hexAt(sample) orelse return;
-    const target_x = endpointGridOffset(target_column, rect.w);
-    const target_y = endpointGridOffset(target_row, rect.h);
-    const target_max_x = endpointGridOffset(target_column + 1, rect.w);
-    const target_max_y = endpointGridOffset(target_row + 1, rect.h);
+    const target_x = gridOffset(target_column, rect.w, endpoint_sample_side);
+    const target_y = gridOffset(target_row, rect.h, endpoint_sample_side);
+    const target_max_x = gridOffset(target_column + 1, rect.w, endpoint_sample_side);
+    const target_max_y = gridOffset(target_row + 1, rect.h, endpoint_sample_side);
     canvas.strokeRect(
         .{
             .x = rect.x + target_x,
             .y = rect.y + target_y,
-            .w = target_max_x - target_x + grid_width,
-            .h = target_max_y - target_y + grid_width,
+            .w = target_max_x - target_x + line,
+            .h = target_max_y - target_y + line,
         },
-        grid_width,
-        targetInk(rgb),
+        line,
+        color.solid(color.contrasting(rgb)),
     );
 }
 
+/// Draw one `endpoint_sample_side`-square cell of the sample, magnified to fill
+/// `rect`, with its own grid lines.
 fn renderEndpointTile(
     canvas: *Canvas,
     rect: Rect,
     sample: Canvas,
-    ui_scale: f64,
+    line: i32,
     source_x: i32,
     source_y: i32,
 ) void {
-    var y = rect.y;
-    while (y < rect.maxY()) : (y += 1) {
-        const sy = source_y + @divTrunc((y - rect.y) * @as(i32, @intCast(endpoint_sample_side)), rect.h);
-        var x = rect.x;
-        while (x < rect.maxX()) : (x += 1) {
-            const sx = source_x + @divTrunc((x - rect.x) * @as(i32, @intCast(endpoint_sample_side)), rect.w);
-            if (sample.get(sx, sy)) |pixel| canvas.set(x, y, pixel);
-        }
-    }
+    canvas.blitNearest(sample, .{
+        .x = source_x,
+        .y = source_y,
+        .w = @intCast(endpoint_sample_side),
+        .h = @intCast(endpoint_sample_side),
+    }, rect);
 
-    const grid_ink = color.black(48);
-    const grid_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
     var step: u32 = 1;
     while (step < endpoint_sample_side) : (step += 1) {
-        const offset = endpointGridOffset(step, rect.w);
-        canvas.blendRect(.{ .x = rect.x + offset, .y = rect.y, .w = grid_width, .h = rect.h }, grid_ink);
-        canvas.blendRect(.{ .x = rect.x, .y = rect.y + offset, .w = rect.w, .h = grid_width }, grid_ink);
+        const offset = gridOffset(step, rect.w, endpoint_sample_side);
+        canvas.blendRect(.{ .x = rect.x + offset, .y = rect.y, .w = line, .h = rect.h }, grid_ink);
+        canvas.blendRect(.{ .x = rect.x, .y = rect.y + offset, .w = rect.w, .h = line }, grid_ink);
     }
 }

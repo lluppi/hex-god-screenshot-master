@@ -1,6 +1,7 @@
-//! The three libc calls the frontends need outside of what `std.posix` still
-//! exposes: writing to a file descriptor (stdout, or the clipboard pipe the
-//! compositor hands us), closing one, and sleeping.
+//! The libc calls the frontends need outside of what `std` still exposes
+//! without dragging in the Io interface: writing to a file descriptor (stdout,
+//! or the clipboard pipe the compositor hands us), closing one, truncating one,
+//! sleeping, and a monotonic clock.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,6 +27,8 @@ pub fn writeAll(fd: c_int, bytes: []const u8) void {
     var remaining = bytes;
     while (remaining.len > 0) {
         const written = write(fd, remaining.ptr, remaining.len);
+        // Best effort: the callers are a one-line print and a clipboard pipe,
+        // and neither has anything useful to do about a short write.
         if (written <= 0) return;
         remaining = remaining[@intCast(written)..];
     }

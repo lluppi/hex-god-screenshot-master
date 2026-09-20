@@ -4,20 +4,22 @@
 const std = @import("std");
 const sys = @import("sys.zig");
 
+/// One line, max 1024 bytes before it is reported as truncated.
+const buffer_bytes = 1024;
+
 pub fn print(comptime fmt: []const u8, args: anytype) void {
-    var buffer: [1024]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, fmt, args) catch {
-        std.debug.print("hgsm: output truncated\n", .{});
-        return;
-    };
-    sys.writeAll(1, text);
+    emit(1, fmt, args);
 }
 
 pub fn fail(comptime fmt: []const u8, args: anytype) void {
-    var buffer: [1024]u8 = undefined;
+    emit(2, fmt, args);
+}
+
+fn emit(fd: c_int, comptime fmt: []const u8, args: anytype) void {
+    var buffer: [buffer_bytes]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, fmt, args) catch {
         std.debug.print("hgsm: output truncated\n", .{});
         return;
     };
-    sys.writeAll(2, text);
+    sys.writeAll(fd, text);
 }

@@ -12,15 +12,27 @@ pub const Rgb = struct {
     b: u8,
 };
 
-pub fn argb(rgb: Rgb, alpha: u8) u32 {
-    return (@as(u32, alpha) << 24) |
+pub const white: Rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+pub const black_rgb: Rgb = .{ .r = 0x00, .g = 0x00, .b = 0x00 };
+/// The instrument's light ink: labels, rails, frames.
+pub const instrument_light: Rgb = .{ .r = 0xee, .g = 0xec, .b = 0xed };
+
+pub fn solid(rgb: Rgb) u32 {
+    return (255 << 24) |
         (@as(u32, rgb.r) << 16) |
         (@as(u32, rgb.g) << 8) |
         @as(u32, rgb.b);
 }
 
-pub fn solid(rgb: Rgb) u32 {
-    return argb(rgb, 255);
+/// Perceived light, 0..255000, from the ITU-R BT.601 weights. Used to decide
+/// whether black or white ink reads better over a sampled colour.
+pub fn luma(rgb: Rgb) u32 {
+    return @as(u32, rgb.r) * 299 + @as(u32, rgb.g) * 587 + @as(u32, rgb.b) * 114;
+}
+
+/// Black or white, whichever contrasts with `rgb`.
+pub fn contrasting(rgb: Rgb) Rgb {
+    return if (luma(rgb) >= 128_000) black_rgb else white;
 }
 
 pub fn rgbOf(pixel: u32) Rgb {
@@ -143,12 +155,12 @@ pub fn over(dst: u32, src: u32) u32 {
 /// Multiply each channel towards black, used for the full-screen dim while the
 /// instrument is active. 236/256 keeps the desktop legible while making the
 /// undimmed selection read as a distinct optical channel.
-pub fn dimPixel(pixel: u32, numerator: u32) u32 {
+const dim_numerator: u32 = 236;
+
+pub fn dimPixel(pixel: u32) u32 {
     const a: u32 = (pixel >> 24) & 0xff;
-    const r = (((pixel >> 16) & 0xff) * numerator) >> 8;
-    const g = (((pixel >> 8) & 0xff) * numerator) >> 8;
-    const b = ((pixel & 0xff) * numerator) >> 8;
+    const r = (((pixel >> 16) & 0xff) * dim_numerator) >> 8;
+    const g = (((pixel >> 8) & 0xff) * dim_numerator) >> 8;
+    const b = ((pixel & 0xff) * dim_numerator) >> 8;
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
-
-pub const dim_numerator: u32 = 236;

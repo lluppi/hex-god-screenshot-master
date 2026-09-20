@@ -22,17 +22,8 @@ pub const Result = union(enum) {
     screenshot: FRect,
 };
 
-pub const Event = union(enum) {
-    none,
-    hovered: Point,
-    selection_changed,
-    finished: Result,
-    cancelled,
-};
-
 pub const Coordinator = struct {
     start: ?Point = null,
-    current: ?Point = null,
     selection: ?FRect = null,
     finished: bool = false,
 
@@ -40,45 +31,32 @@ pub const Coordinator = struct {
         return self.start != null;
     }
 
-    pub fn hover(self: *Coordinator, point: Point) Event {
-        if (self.isSelecting() or self.finished) return .none;
-        self.current = point;
-        return .{ .hovered = point };
-    }
-
-    pub fn begin(self: *Coordinator, point: Point) Event {
-        if (self.finished) return .none;
+    pub fn begin(self: *Coordinator, point: Point) void {
+        if (self.finished) return;
         self.start = point;
-        self.current = point;
         self.selection = .{ .x = point.x, .y = point.y, .w = 0, .h = 0 };
-        return .selection_changed;
     }
 
-    pub fn move(self: *Coordinator, point: Point) Event {
-        if (self.start == null or self.finished) return .none;
-        self.current = point;
+    pub fn move(self: *Coordinator, point: Point) void {
+        if (self.start == null or self.finished) return;
         self.selection = FRect.between(self.start.?, point);
-        return .selection_changed;
     }
 
-    pub fn end(self: *Coordinator, point: Point) Event {
-        const start = self.start orelse return .none;
-        if (self.finished) return .none;
-        _ = self.move(point);
+    /// Resolve the gesture. Null unless this call is the one that finishes it.
+    pub fn end(self: *Coordinator, point: Point) ?Result {
+        const start = self.start orelse return null;
+        if (self.finished) return null;
+        self.move(point);
         self.finished = true;
 
-        if (start.distance(point) < click_threshold) {
-            return .{ .finished = .{ .color = start } };
-        }
-        if (self.selection) |rect| {
-            return .{ .finished = .{ .screenshot = rect } };
-        }
-        return .{ .finished = .{ .color = start } };
+        if (start.distance(point) < click_threshold) return .{ .color = start };
+        if (self.selection) |rect| return .{ .screenshot = rect };
+        return .{ .color = start };
     }
 
-    pub fn cancel(self: *Coordinator) Event {
-        if (self.finished) return .none;
+    pub fn cancel(self: *Coordinator) bool {
+        if (self.finished) return false;
         self.finished = true;
-        return .cancelled;
+        return true;
     }
 };

@@ -28,7 +28,8 @@ pub const ShmBuffer = struct {
 
     /// A drawing view over the mapped memory. Only valid when `stride` is
     /// exactly `width * 4`, which is what `create` guarantees for our own
-    /// buffers; capture buffers are read row by row instead.
+    /// buffers; capture buffers are read row by row instead. This canvas does
+    /// not own the pixels, so it must never be passed to `Canvas.deinit`.
     pub fn canvas(self: *ShmBuffer) Canvas {
         const bytes = self.memory.?[0 .. @as(usize, self.stride) * self.height];
         const pixels: []u32 = @alignCast(std.mem.bytesAsSlice(u32, bytes));
@@ -36,11 +37,12 @@ pub const ShmBuffer = struct {
             .width = self.width,
             .height = self.height,
             .pixels = pixels,
-            .allocator = std.heap.page_allocator,
-            .owns_pixels = false,
+            .allocator = undefined,
         };
     }
 
+    /// Create a buffer and observe its release events. Must not be called on a
+    /// copy: the listener data is this struct's own address.
     pub fn create(
         self: *ShmBuffer,
         shm: *wl.Obj,
@@ -51,7 +53,7 @@ pub const ShmBuffer = struct {
         stride: u32,
     ) !void {
         try self.init(shm, shm_version, width, height, format, stride);
-        self.relocate();
+        wl.addListener(self.buffer.?, &buffer_listener, @ptrCast(self));
     }
 
     /// Create a buffer whose release state is not observed. Capture buffers use
@@ -117,13 +119,6 @@ pub const ShmBuffer = struct {
             .format = format,
             .released = true,
         };
-    }
-
-    /// Point the buffer's event listener at this struct's address again. Must be
-    /// called after the struct is moved (returned by value, stored elsewhere),
-    /// because the listener data is the address itself.
-    pub fn relocate(self: *ShmBuffer) void {
-        if (self.buffer) |buffer| wl.addListener(buffer, &buffer_listener, @ptrCast(self));
     }
 
     /// A drawing view over the mapped memory, only valid when the stride is

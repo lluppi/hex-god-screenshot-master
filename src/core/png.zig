@@ -1,6 +1,9 @@
 //! Minimal PNG encoder. Screenshots go onto the clipboard as PNG, so we need a
 //! real encoder; `std.compress.flate` supplies the zlib stream and we write the
 //! four chunks a PNG reader actually requires.
+//!
+//! Truecolour without alpha: screens are opaque (see color.zig), and dropping
+//! the channel is a quarter less data in every scanline.
 
 const std = @import("std");
 const flate = std.compress.flate;
@@ -27,7 +30,7 @@ pub fn encode(allocator: std.mem.Allocator, canvas: Canvas) ![]u8 {
     std.mem.writeInt(u32, ihdr[0..4], canvas.width, .big);
     std.mem.writeInt(u32, ihdr[4..8], canvas.height, .big);
     ihdr[8] = 8; // bit depth
-    ihdr[9] = 6; // colour type: truecolour with alpha
+    ihdr[9] = 2; // colour type: truecolour
     ihdr[10] = 0; // deflate
     ihdr[11] = 0; // adaptive filtering
     ihdr[12] = 0; // no interlace
@@ -38,9 +41,9 @@ pub fn encode(allocator: std.mem.Allocator, canvas: Canvas) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// RGBA8 scanlines with filter byte 0, un-premultiplied.
+/// RGB8 scanlines with filter byte 0.
 fn scanlines(allocator: std.mem.Allocator, canvas: Canvas) ![]u8 {
-    const stride = @as(usize, canvas.width) * 4 + 1;
+    const stride = @as(usize, canvas.width) * 3 + 1;
     const raw = try allocator.alloc(u8, stride * canvas.height);
     var row: usize = 0;
     while (row < canvas.height) : (row += 1) {
@@ -48,34 +51,33 @@ fn scanlines(allocator: std.mem.Allocator, canvas: Canvas) ![]u8 {
         raw[base] = 0;
         var column: usize = 0;
         while (column < canvas.width) : (column += 1) {
-            const pixel = canvas.pixels[row * canvas.width + column];
-            const alpha: u8 = @intCast((pixel >> 24) & 0xff);
-            const rgb = color.rgbOf(pixel);
-            var r = rgb.r;
-            var g = rgb.g;
-            var b = rgb.b;
-            if (alpha != 0 and alpha != 255) {
-                r = @intCast(@min(255, (@as(u32, r) * 255) / alpha));
-                g = @intCast(@min(255, (@as(u32, g) * 255) / alpha));
-                b = @intCast(@min(255, (@as(u32, b) * 255) / alpha));
-            }
-            const offset = base + 1 + column * 4;
-            raw[offset] = r;
-            raw[offset + 1] = g;
-            raw[offset + 2] = b;
-            raw[offset + 3] = alpha;
+            const rgb = color.rgbOf(canvas.pixels[row * canvas.width + column]);
+            const offset = base + 1 + column * 3;
+            raw[offset] = rgb.r;
+            raw[offset + 1] = rgb.g;
+            raw[offset + 2] = rgb.b;
         }
     }
     return raw;
 }
 
+/// `flate.Compress` rebases inside its output writer, so the writer's buffer has
+/// to be stable; a growing writer is not an option here. The slack covers
+/// deflate's worst case (stored blocks add ~5 bytes per 64 KiB) with room to
+/// spare, and the realloc below trims the excess.
+const deflate_slack = 4096;
+
 fn deflate(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    const output = try allocator.alloc(u8, raw.len + raw.len / 64 + 4096);
+    const capacity = raw.len + raw.len / 64 + deflate_slack;
+    const output = try allocator.alloc(u8, capacity);
+    errdefer allocator.free(output);
+
     var writer: std.Io.Writer = .fixed(output);
     var window: [flate.max_window_len * 2]u8 = undefined;
     var compressor = try flate.Compress.init(&writer, &window, .zlib, .default);
     try compressor.writer.writeAll(raw);
     try compressor.finish();
+
     const written = writer.buffered().len;
     return allocator.realloc(output, written);
 }

@@ -2,8 +2,11 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // This is an interactive full-screen overlay, so make ordinary `zig build`
-    // produce the responsive binary used by the compositor keybind. Developers
+    // This is an interactive full-screen overlay, so ordinary `zig build` has to
+    // produce the responsive binary used by the compositor keybind; a debug
+    // build of this thing is unusably laggy. Do not swap this for
+    // `standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast })`:
+    // that returns Debug unless the caller also passes `-Drelease`. Developers
     // can still request a debug build explicitly with `-Doptimize=Debug`.
     const optimize = b.option(
         std.builtin.OptimizeMode,
@@ -11,20 +14,45 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or binary size",
     ) orelse .ReleaseFast;
 
-    const os_tag = target.result.os.tag;
+    const exe = addExe(b, "hgsm", "src/main.zig", target, optimize, true);
+    linkPlatform(b, exe.root_module, target.result.os.tag);
+    b.installArtifact(exe);
 
-    const module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "build and run");
+    run_step.dependOn(&run_cmd.step);
+
+    // Renderer preview: no compositor required, writes zig-out/preview.png.
+    const preview = addExe(b, "hex-god-preview", "src/preview.zig", target, optimize, false);
+    const preview_cmd = b.addRunArtifact(preview);
+    if (b.args) |args| preview_cmd.addArgs(args);
+    const preview_step = b.step("preview", "render the overlay to zig-out/preview.png");
+    preview_step.dependOn(&preview_cmd.step);
+}
+
+fn addExe(
+    b: *std.Build,
+    name: []const u8,
+    source: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    link_libc: bool,
+) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = link_libc,
+        }),
     });
+}
 
-    const exe = b.addExecutable(.{
-        .name = "hgsm",
-        .root_module = module,
-    });
-
+/// Link what the platform's frontend needs.
+fn linkPlatform(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
     switch (os_tag) {
         .linux => {
             // Vendored protocol bindings, generated with wayland-scanner from
@@ -50,36 +78,9 @@ pub fn build(b: *std.Build) void {
             module.linkFramework("CoreGraphics", .{});
             module.linkSystemLibrary("objc", .{});
         },
-        else => {
-            std.debug.print(
-                "hgsm supports linux (wayland) and macos; target is {s}\n",
-                .{@tagName(os_tag)},
-            );
-            @panic("unsupported target");
-        },
+        else => std.debug.panic(
+            "hgsm supports linux (wayland) and macos; target is {s}",
+            .{@tagName(os_tag)},
+        ),
     }
-
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "build and run");
-    run_step.dependOn(&run_cmd.step);
-
-    // Renderer preview: no compositor required, writes zig-out/preview.png.
-    const preview_module = b.createModule(.{
-        .root_source_file = b.path("src/preview.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const preview = b.addExecutable(.{
-        .name = "hex-god-preview",
-        .root_module = preview_module,
-    });
-    const preview_cmd = b.addRunArtifact(preview);
-    if (b.args) |args| preview_cmd.addArgs(args);
-    const preview_step = b.step("preview", "render the overlay to zig-out/preview.png");
-    preview_step.dependOn(&preview_cmd.step);
 }

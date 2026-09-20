@@ -47,7 +47,7 @@ const FrameListener = extern struct {
 
 const frame_listener = FrameListener{
     .buffer = onBuffer,
-    .flags = onFlags,
+    .flags = @ptrCast(&wl.noop),
     .ready = onReady,
     .failed = onFailed,
     .damage = @ptrCast(&wl.noop),
@@ -75,12 +75,6 @@ fn onBuffer(
     wl.screencopyFrameCopy(frame.?, self.buffer.buffer.?);
 }
 
-fn onFlags(data: ?*anyopaque, frame: ?*wl.Obj, flags: u32) callconv(.c) void {
-    _ = data;
-    _ = frame;
-    _ = flags;
-}
-
 fn onReady(data: ?*anyopaque, frame: ?*wl.Obj, sec_hi: u32, sec_lo: u32, nsec: u32) callconv(.c) void {
     _ = frame;
     _ = sec_hi;
@@ -94,34 +88,14 @@ fn onFailed(data: ?*anyopaque, frame: ?*wl.Obj) callconv(.c) void {
     reader(data).state = .failed;
 }
 
-/// Ask for one region of one output and block until the pixels have landed.
-/// `region` is output-local logical coordinates. The returned buffer is the
-/// caller's to destroy.
-pub fn captureRegion(
-    display: *wl.Obj,
-    manager: *wl.Obj,
-    manager_version: u32,
-    shm_obj: *wl.Obj,
-    shm_version: u32,
-    output: *wl.Obj,
-    region: FRect,
-) Error!shm.ShmBuffer {
-    return capture(display, manager, manager_version, shm_obj, shm_version, output, region);
-}
+/// Poll for a frame for this long before giving up: 400 tries of 250 ms.
+const max_pump_attempts: usize = 400;
+const pump_timeout_ms: i32 = 250;
 
-/// Same, for a whole output.
-pub fn captureOutput(
-    display: *wl.Obj,
-    manager: *wl.Obj,
-    manager_version: u32,
-    shm_obj: *wl.Obj,
-    shm_version: u32,
-    output: *wl.Obj,
-) Error!shm.ShmBuffer {
-    return capture(display, manager, manager_version, shm_obj, shm_version, output, null);
-}
-
-fn capture(
+/// Ask for one region of one output (or the whole output, when `region` is
+/// null) and block until the pixels have landed. `region` is output-local
+/// logical coordinates. The returned buffer is the caller's to destroy.
+pub fn capture(
     display: *wl.Obj,
     manager: *wl.Obj,
     manager_version: u32,
@@ -154,8 +128,8 @@ fn capture(
     var attempts: usize = 0;
     while (context.state == .pending) {
         attempts += 1;
-        if (attempts > 400) return Error.Timeout;
-        wl.pump(display, 250) catch return Error.Disconnected;
+        if (attempts > max_pump_attempts) return Error.Timeout;
+        wl.pump(display, pump_timeout_ms) catch return Error.Disconnected;
     }
     if (context.state == .failed) return Error.CaptureFailed;
     return context.buffer;
@@ -178,7 +152,8 @@ pub fn toCanvas(allocator: std.mem.Allocator, captured: *shm.ShmBuffer) Error!Ca
             wl.shm_format_argb8888 => {
                 @memcpy(canvas.pixels[dest_start .. dest_start + captured.width], source);
             },
-            1 => { // WL_SHM_FORMAT_XRGB8888: alpha is undefined
+            wl.shm_format_xrgb8888 => {
+                // The compositor leaves alpha undefined; the screen is opaque.
                 for (source, 0..) |pixel, i| canvas.pixels[dest_start + i] = pixel | 0xff000000;
             },
             else => return Error.UnsupportedFormat,

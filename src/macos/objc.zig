@@ -48,11 +48,6 @@ pub const CGRect = extern struct {
     }
 };
 
-/// NSRect is CGRect on 64-bit macOS, so one struct serves both.
-pub const NSRect = CGRect;
-pub const NSPoint = CGPoint;
-pub const NSSize = CGSize;
-
 extern "c" fn objc_getClass(name: [*:0]const u8) ?*anyopaque;
 extern "c" fn sel_registerName(name: [*:0]const u8) ?*anyopaque;
 extern "c" fn objc_allocateClassPair(superclass: ?*anyopaque, name: [*:0]const u8, extra: usize) ?*anyopaque;
@@ -138,13 +133,6 @@ pub const CGImageRef = *anyopaque;
 pub const CGContextRef = *anyopaque;
 pub const CGColorSpaceRef = *anyopaque;
 
-pub extern "c" fn CGMainDisplayID() CGDirectDisplayID;
-pub extern "c" fn CGGetActiveDisplayList(
-    max_displays: u32,
-    displays: [*]CGDirectDisplayID,
-    count: *u32,
-) c_int;
-pub extern "c" fn CGDisplayBounds(display: CGDirectDisplayID) CGRect;
 pub extern "c" fn CGDisplayCreateImage(display: CGDirectDisplayID) ?CGImageRef;
 pub extern "c" fn CGDisplayCreateImageForRect(
     display: CGDirectDisplayID,
@@ -164,7 +152,6 @@ pub extern "c" fn CGBitmapContextCreate(
     space: CGColorSpaceRef,
     bitmap_info: u32,
 ) ?CGContextRef;
-pub extern "c" fn CGBitmapContextGetData(context: CGContextRef) ?*anyopaque;
 pub extern "c" fn CGContextClipToRect(context: CGContextRef, rect: CGRect) void;
 pub extern "c" fn CGContextDrawImage(context: CGContextRef, rect: CGRect, image: CGImageRef) void;
 pub extern "c" fn CGContextSetInterpolationQuality(context: CGContextRef, quality: c_int) void;
@@ -182,7 +169,6 @@ pub const interpolation_none: c_int = 0;
 // AppKit / Foundation constants
 // ---------------------------------------------------------------------------
 
-pub const application_activation_policy_regular: NSInteger = 0;
 pub const application_activation_policy_accessory: NSInteger = 1;
 
 pub const window_style_borderless: NSUInteger = 0;
@@ -192,4 +178,3 @@ pub const collection_behavior_can_join_all_spaces: NSUInteger = 1 << 0;
 pub const collection_behavior_full_screen_auxiliary: NSUInteger = 1 << 8;
 
 pub const escape_keycode: u16 = 53;
-pub const mouse_button_right: NSInteger = 1;

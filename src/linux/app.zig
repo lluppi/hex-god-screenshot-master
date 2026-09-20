@@ -16,7 +16,6 @@ const std = @import("std");
 const wl = @import("wl.zig");
 const shm_mod = @import("shm.zig");
 const capture = @import("capture.zig");
-const sampling = @import("../core/sampling.zig");
 const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
 const color_mod = @import("../core/color.zig");
@@ -39,59 +38,6 @@ const btn_right: u32 = 0x111;
 /// Synthetic gestures for development: they drive the very same functions the
 /// pointer handlers call, so a click or a drag can be exercised (and screenshoted
 /// mid selection) without a mouse or an input injector on the box.
-const DevGesture = union(enum) {
-    none,
-    click: Point,
-    drag: struct { start: Point, end: Point, via: ?Point, hold_ms: u64 },
-};
-
-fn parseDevGesture(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    remaining: *std.ArrayList([]const u8),
-) !DevGesture {
-    var click: ?Point = null;
-    var drag: ?[4]f64 = null;
-    var via: ?Point = null;
-    var hold_ms: u64 = 1000;
-
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--dev-click")) {
-            index += 1;
-            if (index >= args.len) return error.MissingPoint;
-            click = cli.parsePoint(args[index]) orelse return error.MissingPoint;
-        } else if (std.mem.eql(u8, arg, "--dev-drag")) {
-            index += 1;
-            if (index >= args.len) return error.MissingRect;
-            const rect = cli.parseRect(args[index]) orelse return error.MissingRect;
-            drag = .{ rect.x, rect.y, rect.maxX(), rect.maxY() };
-        } else if (std.mem.eql(u8, arg, "--dev-via")) {
-            index += 1;
-            if (index >= args.len) return error.MissingPoint;
-            via = cli.parsePoint(args[index]) orelse return error.MissingPoint;
-        } else if (std.mem.eql(u8, arg, "--dev-hold")) {
-            index += 1;
-            if (index >= args.len) return error.MissingRect;
-            hold_ms = std.fmt.parseInt(u64, args[index], 10) catch return error.MissingRect;
-        } else {
-            try remaining.append(allocator, arg);
-        }
-    }
-
-    if (drag) |values| {
-        return .{ .drag = .{
-            .start = .{ .x = values[0], .y = values[1] },
-            .end = .{ .x = values[2], .y = values[3] },
-            .via = via,
-            .hold_ms = hold_ms,
-        } };
-    }
-    if (click) |point| return .{ .click = point };
-    return .none;
-}
-
 const clipboard_timeout_ms: i64 = 60_000;
 const clipboard_idle_after_send_ms: i64 = 5_000;
 const overlay_settle_ms: u64 = 60;
@@ -100,7 +46,6 @@ const Output = struct {
     app: *App,
     wl_output: *wl.Obj,
     interaction_id: interaction_mod.SurfaceId = 0,
-    xdg_output: ?*wl.Obj = null,
     /// Global logical position and size, from xdg_output (or the mode size).
     logical: FRect = .{},
     logical_known: bool = false,
@@ -122,7 +67,6 @@ const Output = struct {
     surface: ?*wl.Obj = null,
     surface_version: u32 = 1,
     layer_surface: ?*wl.Obj = null,
-    viewport: ?*wl.Obj = null,
     configured: bool = false,
 
     fn canvasSize(self: *Output) Rect {
@@ -132,12 +76,11 @@ const Output = struct {
         return .{};
     }
 
-    fn localLogical(self: *Output, global: Point) Point {
-        return .{ .x = global.x - self.logical.x, .y = global.y - self.logical.y };
-    }
-
-    fn toPhysical(self: *Output, local: Point) Point {
-        return .{ .x = local.x * self.scale, .y = local.y * self.scale };
+    /// A geometry event: a zero dimension means "not known yet", so it is left
+    /// alone. Callers decide when the size is complete enough to use.
+    fn setLogicalSize(self: *Output, w: i32, h: i32) void {
+        if (w > 0) self.logical.w = @floatFromInt(w);
+        if (h > 0) self.logical.h = @floatFromInt(h);
     }
 };
 
@@ -162,17 +105,18 @@ pub const App = struct {
     seat_version: u32 = 1,
     pointer: ?*wl.Obj = null,
     pointer_version: u32 = 1,
-    keyboard: ?*wl.Obj = null,
-    keyboard_version: u32 = 1,
+    /// A keyboard is created only once, however often capabilities are announced.
+    keyboard_active: bool = false,
     data_device: ?*wl.Obj = null,
     outputs: std.ArrayList(*Output) = .empty,
+    /// The outputs as the shared interaction sees them, built once after the
+    /// baselines exist. Indexed by `interaction_id`.
+    surfaces: []interaction_mod.Surface = &.{},
 
     // Native pointer routing plus shared gesture/loupe state.
     cursor_output: ?*Output = null,
     interaction: ?interaction_mod.Interaction = null,
-    buttons: u32 = 0,
-    pointer_serial: u32 = 0,
-    last_serial: u32 = 0,
+    serial: u32 = 0,
 
     // Clipboard.
     clip_source: ?*wl.Obj = null,
@@ -181,7 +125,9 @@ pub const App = struct {
     clip_last_send_ms: ?i64 = null,
     clip_cancelled: bool = false,
 
-    // Keyboard.
+    // Keyboard. `xkb_state` is what turns a keycode into a keysym; the keymap it
+    // was built from has to outlive it, and both are replaced when the
+    // compositor sends a new keymap.
     xkb_context: ?*anyopaque = null,
     xkb_keymap: ?*anyopaque = null,
     xkb_state: ?*anyopaque = null,
@@ -212,17 +158,9 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
     _ = args.next(); // argv[0]
     var raw: std.ArrayList([]const u8) = .empty;
     while (args.next()) |arg| raw.append(allocator, arg) catch return error.OutOfMemory;
-    var rest: std.ArrayList([]const u8) = .empty;
-    const dev_gesture = parseDevGesture(allocator, raw.items, &rest) catch {
-        out.fail(
-            "--dev-click X,Y | --dev-drag X,Y,W,H | --dev-via X,Y | --dev-hold MS\n",
-            .{},
-        );
-        std.process.exit(2);
-    };
 
-    const options = switch (cli.parse(rest.items)) {
-        .options => |parsed| parsed,
+    const invocation = switch (cli.parse(raw.items)) {
+        .run => |parsed| parsed,
         .help => {
             cli.printUsage();
             return;
@@ -231,11 +169,14 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             cli.printVersion();
             return;
         },
-        .invalid => {
+        .invalid => |message| {
+            out.fail("{s}\n", .{message});
             cli.printUsage();
             std.process.exit(2);
         },
     };
+    const command = invocation.command;
+    const dev = invocation.dev;
 
     const display = wl.wl_display_connect(null) orelse {
         out.fail("cannot connect to a wayland compositor (is WAYLAND_DISPLAY set?)\n", .{});
@@ -248,8 +189,9 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
 
     try connect(&app);
     try captureBaselines(&app);
+    app.surfaces = try buildSurfaces(&app);
 
-    switch (options.mode) {
+    switch (command) {
         .info => {
             for (app.outputs.items) |o| {
                 out.print(
@@ -266,27 +208,26 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                 );
             }
         },
-        .pick => {
-            const point = options.pick.?;
-            const rgb = pickColor(&app, point) orelse {
+        .pick => |point| {
+            const rgb = interaction_mod.colorAt(app.surfaces, point) orelse {
                 out.fail("no output contains {d},{d}\n", .{ point.x, point.y });
                 std.process.exit(1);
             };
             const hex = color_mod.hexString(rgb);
             out.print("{s}\n", .{hex});
-            serveClipboard(&app, "text/plain;charset=utf-8", &hex);
+            publish(&app, "text/plain;charset=utf-8", &hex);
         },
-        .shot => {
-            var canvas = try captureScreenshot(&app, options.shot.?);
+        .shot => |rect| {
+            var canvas = try captureScreenshot(&app, rect);
             defer canvas.deinit();
             const bytes = try png.encode(allocator, canvas);
             out.print("Screenshot copied to clipboard\n", .{});
-            serveClipboard(&app, "image/png", bytes);
+            publish(&app, "image/png", bytes);
         },
         .interactive => {
             try startOverlay(&app);
-            switch (dev_gesture) {
-                .none => try eventLoop(&app),
+            switch (dev) {
+                .none => {},
                 .click => |point| {
                     app.dev_gesture_active = true;
                     devClick(&app, point);
@@ -297,14 +238,12 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                     app.dev_gesture_active = false;
                 },
             }
-            try eventLoop(&app);
+            eventLoop(&app);
             teardownOverlay(&app);
         },
     }
 
-    if (options.mode != .interactive) {
-        try eventLoop(&app);
-    }
+    if (command != .interactive) eventLoop(&app);
     if (app.exit_code != 0) std.process.exit(app.exit_code);
 }
 
@@ -326,17 +265,18 @@ fn connect(self: *App) !void {
     }
 
     // xdg-output for real logical geometry; without it we fall back to the
-    // output's mode size, which is only correct at scale 1.
+    // output's mode size, which is only correct at scale 1. The xdg objects only
+    // exist to deliver that geometry, so they are destroyed once it has arrived.
     if (self.xdg_manager) |manager| {
-        for (self.outputs.items) |o| {
-            const xdg = wl.xdgOutputManagerGetOutput(manager, self.xdg_manager_version, o.wl_output) orelse continue;
-            o.xdg_output = xdg;
-            wl.addListener(xdg, &xdg_output_listener, o);
+        const xdg_outputs = try self.allocator.alloc(?*wl.Obj, self.outputs.items.len);
+        defer self.allocator.free(xdg_outputs);
+        for (self.outputs.items, 0..) |o, index| {
+            xdg_outputs[index] = wl.xdgOutputManagerGetOutput(manager, self.xdg_manager_version, o.wl_output);
+            if (xdg_outputs[index]) |xdg| wl.addListener(xdg, &xdg_output_listener, o);
         }
         try roundtrip(self);
-        for (self.outputs.items) |o| {
-            if (o.xdg_output) |xdg| wl.xdgOutputDestroy(xdg);
-            o.xdg_output = null;
+        for (xdg_outputs) |xdg| {
+            if (xdg) |proxy| wl.xdgOutputDestroy(proxy);
         }
     }
 
@@ -369,13 +309,14 @@ fn roundtrip(self: *App) !void {
 /// and what the loupe magnifies, so the loupe can never magnify itself.
 fn captureBaselines(self: *App) !void {
     for (self.outputs.items) |o| {
-        var captured = capture.captureOutput(
+        var captured = capture.capture(
             self.display,
             self.screencopy.?,
             self.screencopy_version,
             self.shm.?,
             self.shm_version,
             o.wl_output,
+            null,
         ) catch |err| {
             out.fail("could not capture output: {t}\n", .{err});
             return err;
@@ -398,6 +339,17 @@ fn captureBaselines(self: *App) !void {
     }
 }
 
+/// The immutable per-output surfaces the shared interaction works in, built once
+/// after the baselines exist. `interaction_id` is the index.
+fn buildSurfaces(self: *App) ![]interaction_mod.Surface {
+    const surfaces = try self.allocator.alloc(interaction_mod.Surface, self.outputs.items.len);
+    for (self.outputs.items, 0..) |o, index| {
+        o.interaction_id = index;
+        surfaces[index] = .{ .logical = o.logical, .scale = o.scale, .baseline = &o.baseline.? };
+    }
+    return surfaces;
+}
+
 // ---------------------------------------------------------------------------
 // Overlay lifecycle
 // ---------------------------------------------------------------------------
@@ -408,17 +360,7 @@ fn startOverlay(self: *App) !void {
         return error.MissingProtocols;
     }
 
-    const surfaces = try self.allocator.alloc(interaction_mod.Surface, self.outputs.items.len);
-    defer self.allocator.free(surfaces);
-    for (self.outputs.items, 0..) |o, index| {
-        o.interaction_id = index;
-        surfaces[index] = .{
-            .logical = o.logical,
-            .scale = o.scale,
-            .baseline = &o.baseline.?,
-        };
-    }
-    self.interaction = try interaction_mod.Interaction.init(self.allocator, surfaces);
+    self.interaction = try interaction_mod.Interaction.init(self.allocator, self.surfaces);
     errdefer {
         self.interaction.?.deinit();
         self.interaction = null;
@@ -451,9 +393,9 @@ fn startOverlay(self: *App) !void {
         wl.layerSurfaceSetKeyboardInteractivity(layer_surface, wl.keyboard_interactivity_exclusive);
 
         if (self.viewporter) |viewporter| {
-            const viewport = wl.viewporterGetViewport(viewporter, 1, surface);
-            if (viewport) |vp| {
-                o.viewport = vp;
+            // The viewport is parented to the surface, so destroying the surface
+            // destroys it too; only the destination size matters here.
+            if (wl.viewporterGetViewport(viewporter, 1, surface)) |vp| {
                 wl.viewportSetDestination(
                     vp,
                     @intFromFloat(@max(1, o.logical.w)),
@@ -515,7 +457,8 @@ fn teardownOverlay(self: *App) void {
     self.overlays_up = false;
 }
 
-/// Wait for the compositor to actually drop our surfaces, then capture.
+/// Wait for the compositor to actually drop our surfaces, then capture. Best
+/// effort: if the compositor has gone away the capture that follows reports it.
 fn settle(self: *App) void {
     roundtrip(self) catch {};
     sys.sleepMs(overlay_settle_ms);
@@ -526,8 +469,11 @@ fn settle(self: *App) void {
 // Painting
 // ---------------------------------------------------------------------------
 
-fn repaintOutput(self: *App, o: *Output, region: Rect) void {
-    _ = self;
+/// Queue a repaint of one output's region and flush it. This is the frontend's
+/// whole implementation of the shared `PaintFn`.
+fn paintOutput(ctx: *anyopaque, surface: interaction_mod.SurfaceId, region: Rect) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    const o = self.outputs.items[surface];
     if (!o.configured or !o.have_buffers) return;
     const clipped = region.clamped(
         @intCast(o.baseline.?.width),
@@ -583,32 +529,13 @@ fn flushOutput(o: *Output) void {
     }
     o.dirty[index].clearRetainingCapacity();
 
-    for (regions[0..count]) |region| compose(o, &canvas, region);
+    if (o.app.interaction) |*interaction| {
+        for (regions[0..count]) |region| interaction.render(o.interaction_id, &canvas, region);
+    }
 
     wl.surfaceAttach(o.surface.?, buffer.buffer.?, 0, 0);
     if (o.surface_version >= 4) {
-        for (regions[0..count]) |region| damageBuffer(o, region);
-    } else {
-        damageBuffer(o, regions[0]);
-    }
-    wl.surfaceCommit(o.surface.?);
-    buffer.released = false;
-    o.buffer_index = 1 - index;
-}
-
-/// Upper bound on regions composed in one commit; anything past it is folded
-/// into the last rectangle so no region is silently dropped.
-const MAX_DIRTY = 32;
-
-fn damageBuffer(o: *Output, region: Rect) void {
-    if (o.surface_version >= 4) {
-        const args = [_]wl.Argument{
-            .{ .i = region.x },
-            .{ .i = region.y },
-            .{ .i = region.w },
-            .{ .i = region.h },
-        };
-        _ = wl.request(o.surface.?, 9, &args); // wl_surface.damage_buffer
+        for (regions[0..count]) |region| wl.surfaceDamageBuffer(o.surface.?, region);
     } else {
         // Fall back to one full-surface damage call per commit.
         wl.surfaceDamage(
@@ -619,35 +546,28 @@ fn damageBuffer(o: *Output, region: Rect) void {
             @intFromFloat(o.logical.h),
         );
     }
+    wl.surfaceCommit(o.surface.?);
+    buffer.released = false;
+    o.buffer_index = 1 - index;
 }
 
-/// Paint one region of one output from the baseline plus the current gesture.
-fn compose(o: *Output, canvas: *Canvas, region: Rect) void {
-    const interaction = &(o.app.interaction orelse return);
-    interaction.render(o.interaction_id, canvas, region);
-}
+/// Upper bound on regions composed in one commit; anything past it is folded
+/// into the last rectangle so no region is silently dropped.
+const MAX_DIRTY = 32;
 
 // ---------------------------------------------------------------------------
 // Gesture
 // ---------------------------------------------------------------------------
 
-fn repaintDamages(self: *App, damages: []const interaction_mod.Damage) void {
-    for (damages) |damage| {
-        repaintOutput(self, self.outputs.items[damage.surface], damage.rect);
-    }
-}
-
 fn updateCursor(self: *App, o: *Output, local: Point) void {
-    const interaction = &(self.interaction orelse return);
     self.cursor_output = o;
-    const damages = interaction.moveCursor(o.interaction_id, local);
-    repaintDamages(self, damages);
+    const interaction = &(self.interaction orelse return);
+    interaction_mod.paintDamages(interaction.moveCursor(o.interaction_id, local), self, paintOutput);
 }
 
 fn beginSelection(self: *App) void {
     const interaction = &(self.interaction orelse return);
-    const damages = interaction.beginSelection();
-    repaintDamages(self, damages);
+    interaction_mod.paintDamages(interaction.beginSelection(), self, paintOutput);
 }
 
 fn endSelection(self: *App) void {
@@ -665,14 +585,11 @@ fn cancel(self: *App) void {
 /// Move the synthetic cursor to a global logical point, resolving which output
 /// it lands on. Only used by the dev gestures.
 fn devMoveCursor(self: *App, global: Point) void {
-    for (self.outputs.items) |o| {
-        const local = o.localLogical(global);
-        if (local.x < 0 or local.y < 0) continue;
-        if (local.x >= o.logical.w or local.y >= o.logical.h) continue;
-        updateCursor(self, o, local);
+    const hit = interaction_mod.hitTest(self.surfaces, global) orelse {
+        out.fail("no output contains {d},{d}\n", .{ global.x, global.y });
         return;
-    }
-    out.fail("no output contains {d},{d}\n", .{ global.x, global.y });
+    };
+    updateCursor(self, self.outputs.items[hit.surface], hit.local);
 }
 
 /// Exactly what a press-and-release in place does: a click that resolves to a
@@ -707,26 +624,30 @@ fn devDrag(self: *App, start: Point, via: ?Point, end: Point, hold_ms: u64) void
 
 fn holdWithPump(self: *App, milliseconds: u64) void {
     var remaining = milliseconds;
-    while (remaining > 0) : (remaining -= @min(remaining, 20)) {
-        wl.pump(self.display, 20) catch return;
+    while (remaining > 0) : (remaining -= @min(remaining, dev_pump_slice_ms)) {
+        wl.pump(self.display, dev_pump_slice_ms) catch return;
         flushAll(self);
     }
 }
 
+/// Slice of the event loop a dev gesture pumps between steps, so a commit
+/// reaches the compositor instead of sitting in our outgoing buffer.
+const dev_pump_slice_ms: i32 = 20;
+
 fn finish(self: *App, result: interaction_mod.Result) void {
     switch (result) {
         .color => |point| {
-            const rgb = pickColor(self, point) orelse {
-                out.fail("the pixel colour could not be read\n", .{});
-                self.exit_code = 1;
-                self.quit = true;
+            const rgb = interaction_mod.colorAt(self.surfaces, point) orelse {
+                fail(self, "the pixel colour could not be read");
                 return;
             };
             const hex = color_mod.hexString(rgb);
             out.print("{s}\n", .{hex});
+            // The overlay has to be gone before the clipboard paste happens,
+            // or the user pastes our own dimming.
             teardownOverlay(self);
             settle(self);
-            serveClipboard(self, "text/plain;charset=utf-8", &hex);
+            publish(self, "text/plain;charset=utf-8", &hex);
         },
         .screenshot => |rect| {
             self.pending_screenshot = rect;
@@ -734,99 +655,53 @@ fn finish(self: *App, result: interaction_mod.Result) void {
     }
 }
 
+/// Give up: report, set the exit code and let the event loop stop.
+fn fail(self: *App, message: []const u8) void {
+    out.fail("{s}\n", .{message});
+    self.exit_code = 1;
+    self.quit = true;
+}
+
 /// Copy a drag selection and publish it, after the overlay is out of the way.
 fn finishScreenshot(self: *App, rect: FRect) void {
     teardownOverlay(self);
     settle(self);
-    const canvas = captureScreenshot(self, rect) catch |err| {
+    var canvas = captureScreenshot(self, rect) catch |err| {
         out.fail("screenshot failed: {t}\n", .{err});
         self.exit_code = 1;
         self.quit = true;
         return;
     };
+    defer canvas.deinit();
     const bytes = png.encode(self.allocator, canvas) catch |err| {
         out.fail("png encoding failed: {t}\n", .{err});
         self.exit_code = 1;
         self.quit = true;
         return;
     };
+    defer self.allocator.free(bytes);
     out.print("Screenshot copied to clipboard\n", .{});
-    serveClipboard(self, "image/png", bytes);
+    publish(self, "image/png", bytes);
 }
 
-fn pickColor(self: *App, global: Point) ?color_mod.Rgb {
-    for (self.outputs.items) |o| {
-        const baseline = o.baseline orelse continue;
-        const local = o.localLogical(global);
-        if (local.x < 0 or local.y < 0) continue;
-        if (local.x >= o.logical.w or local.y >= o.logical.h) continue;
-        const physical = o.toPhysical(local);
-        if (physical.x < 0 or physical.y < 0) continue;
-        if (physical.x >= @as(f64, @floatFromInt(baseline.width))) continue;
-        if (physical.y >= @as(f64, @floatFromInt(baseline.height))) continue;
-        return sampling.sampleHex(&baseline, o.scale, local);
-    }
-    return null;
-}
-
-/// Capture a global logical rectangle.
-///
-/// The common case - the whole rectangle on one output - keeps the captured
-/// pixels exactly as the compositor produced them, which is what makes the
-/// result byte-identical to other screencopy clients. Only a selection spanning
-/// displays needs a composed image, since the two captures have to be placed in
-/// one common pixel grid.
+/// Capture a global logical rectangle. The composition and the single-output
+/// shortcut both live in the shared interaction; this only supplies the
+/// per-output capture.
 fn captureScreenshot(self: *App, rect: FRect) !Canvas {
-    var single: ?*Output = null;
-    var count: usize = 0;
-    for (self.outputs.items) |o| {
-        if (rect.intersection(o.logical).isEmpty()) continue;
-        single = o;
-        count += 1;
-    }
-    if (count == 1) {
-        const o = single.?;
-        const intersection = rect.intersection(o.logical);
-        var captured = try captureRegionOf(self, o, intersection);
-        defer captured.destroy();
-        return capture.toCanvas(self.allocator, &captured);
-    }
-
-    var scale: f64 = 1;
-    for (self.outputs.items) |o| scale = @max(scale, o.scale);
-
-    const width: u32 = @intFromFloat(@max(1, @round(rect.w * scale)));
-    const height: u32 = @intFromFloat(@max(1, @round(rect.h * scale)));
-    var output_canvas = try Canvas.init(self.allocator, width, height);
-    errdefer output_canvas.deinit();
-
-    for (self.outputs.items) |o| {
-        const intersection = rect.intersection(o.logical);
-        if (intersection.isEmpty()) continue;
-        var captured = try captureRegionOf(self, o, intersection);
-        defer captured.destroy();
-
-        var image = try capture.toCanvas(self.allocator, &captured);
-        const destination = Rect.roundF(.{
-            .x = (intersection.x - rect.x) * scale,
-            .y = (intersection.y - rect.y) * scale,
-            .w = intersection.w * scale,
-            .h = intersection.h * scale,
-        });
-        output_canvas.blitNearest(image, destination);
-        image.deinit();
-    }
-    return output_canvas;
+    return interaction_mod.captureScreenshot(self.allocator, self.surfaces, rect, self, captureOne);
 }
 
-fn captureRegionOf(self: *App, o: *Output, intersection: FRect) !shm_mod.ShmBuffer {
+/// Capture one output's share of a screenshot. `intersection` is in global
+/// logical coordinates; the protocol wants it output-local.
+fn captureOne(self: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
+    const o = self.outputs.items[surface];
     const local = FRect{
         .x = intersection.x - o.logical.x,
         .y = intersection.y - o.logical.y,
         .w = intersection.w,
         .h = intersection.h,
     };
-    return capture.captureRegion(
+    var captured = capture.capture(
         self.display,
         self.screencopy.?,
         self.screencopy_version,
@@ -838,23 +713,21 @@ fn captureRegionOf(self: *App, o: *Output, intersection: FRect) !shm_mod.ShmBuff
         out.fail("capture of a display region failed: {t}\n", .{err});
         return err;
     };
+    defer captured.destroy();
+    return capture.toCanvas(self.allocator, &captured);
 }
 
 // ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
 
-fn serveClipboard(self: *App, mime: [:0]const u8, payload: []const u8) void {
+fn publish(self: *App, mime: [:0]const u8, payload: []const u8) void {
     const manager = self.data_device_manager orelse {
-        out.fail("this compositor has no clipboard support\n", .{});
-        self.exit_code = 1;
-        self.quit = true;
+        fail(self, "this compositor has no clipboard support");
         return;
     };
     const device = self.data_device orelse {
-        out.fail("this compositor has no clipboard device\n", .{});
-        self.exit_code = 1;
-        self.quit = true;
+        fail(self, "this compositor has no clipboard device");
         return;
     };
 
@@ -870,7 +743,7 @@ fn serveClipboard(self: *App, mime: [:0]const u8, payload: []const u8) void {
     };
     wl.addListener(source, &data_source_listener, self);
     wl.dataSourceOffer(source, mime.ptr);
-    wl.dataDeviceSetSelection(device, source, self.last_serial);
+    wl.dataDeviceSetSelection(device, source, self.serial);
     _ = wl.wl_display_flush(self.display);
 
     self.clip_source = source;
@@ -897,9 +770,13 @@ fn nowMs() i64 {
 // Event loop
 // ---------------------------------------------------------------------------
 
-fn eventLoop(self: *App) !void {
+/// How long a quiet event loop sleeps between pumps. Only a fallback: pointer
+/// and clipboard traffic wakes it sooner.
+const event_pump_timeout_ms: i32 = 40;
+
+fn eventLoop(self: *App) void {
     while (!self.quit) {
-        wl.pump(self.display, 40) catch {
+        wl.pump(self.display, event_pump_timeout_ms) catch {
             self.quit = true;
             return;
         };
@@ -931,7 +808,7 @@ fn eventLoop(self: *App) !void {
 fn hideCursor(self: *App) void {
     const pointer = self.pointer orelse return;
     if (self.pointer_version < 1) return;
-    wl.pointerSetCursor(pointer, self.pointer_serial, null, 0, 0);
+    wl.pointerSetCursor(pointer, self.serial, null, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -959,26 +836,32 @@ fn onRegistryGlobal(
     const registry_obj = registry.?;
     const iface = std.mem.span(interface.?);
 
-    if (std.mem.eql(u8, iface, "wl_compositor")) {
-        app.compositor_version = @min(version, 6);
-        app.compositor = wl.bind(registry_obj, name, &wl.wl_compositor_interface, app.compositor_version);
-    } else if (std.mem.eql(u8, iface, "wl_shm")) {
-        app.shm_version = @min(version, 1);
-        app.shm = wl.bind(registry_obj, name, &wl.wl_shm_interface, app.shm_version);
-    } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
-        app.layer_shell_version = @min(version, 5);
-        app.layer_shell = wl.bind(registry_obj, name, &wl.zwlr_layer_shell_v1_interface, app.layer_shell_version);
-    } else if (std.mem.eql(u8, iface, "zwlr_screencopy_manager_v1")) {
-        app.screencopy_version = @min(version, 3);
-        app.screencopy = wl.bind(registry_obj, name, &wl.zwlr_screencopy_manager_v1_interface, app.screencopy_version);
-    } else if (std.mem.eql(u8, iface, "zxdg_output_manager_v1")) {
-        app.xdg_manager_version = @min(version, 3);
-        app.xdg_manager = wl.bind(registry_obj, name, &wl.zxdg_output_manager_v1_interface, app.xdg_manager_version);
-    } else if (std.mem.eql(u8, iface, "wp_viewporter")) {
+    // Plain globals: bind once at the highest version we understand, recording
+    // both the proxy and the version we settled on.
+    const Binding = struct {
+        name: []const u8,
+        iface: *const wl.Interface,
+        max_version: u32,
+        version: *u32,
+        proxy: *?*wl.Obj,
+    };
+    const bindings = [_]Binding{
+        .{ .name = "wl_compositor", .iface = &wl.wl_compositor_interface, .max_version = 6, .version = &app.compositor_version, .proxy = &app.compositor },
+        .{ .name = "wl_shm", .iface = &wl.wl_shm_interface, .max_version = 1, .version = &app.shm_version, .proxy = &app.shm },
+        .{ .name = "zwlr_layer_shell_v1", .iface = &wl.zwlr_layer_shell_v1_interface, .max_version = 5, .version = &app.layer_shell_version, .proxy = &app.layer_shell },
+        .{ .name = "zwlr_screencopy_manager_v1", .iface = &wl.zwlr_screencopy_manager_v1_interface, .max_version = 3, .version = &app.screencopy_version, .proxy = &app.screencopy },
+        .{ .name = "zxdg_output_manager_v1", .iface = &wl.zxdg_output_manager_v1_interface, .max_version = 3, .version = &app.xdg_manager_version, .proxy = &app.xdg_manager },
+        .{ .name = "wl_data_device_manager", .iface = &wl.wl_data_device_manager_interface, .max_version = 3, .version = &app.data_device_manager_version, .proxy = &app.data_device_manager },
+    };
+    for (bindings) |binding| {
+        if (!std.mem.eql(u8, iface, binding.name)) continue;
+        binding.version.* = @min(version, binding.max_version);
+        binding.proxy.* = wl.bind(registry_obj, name, binding.iface, binding.version.*);
+        return;
+    }
+
+    if (std.mem.eql(u8, iface, "wp_viewporter")) {
         app.viewporter = wl.bind(registry_obj, name, &wl.wp_viewporter_interface, @min(version, 1));
-    } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
-        app.data_device_manager_version = @min(version, 3);
-        app.data_device_manager = wl.bind(registry_obj, name, &wl.wl_data_device_manager_interface, app.data_device_manager_version);
     } else if (std.mem.eql(u8, iface, "wl_seat")) {
         app.seat_version = @min(version, 5);
         const seat = wl.bind(registry_obj, name, &wl.wl_seat_interface, app.seat_version);
@@ -1012,10 +895,9 @@ fn onSeatCapabilities(data: ?*anyopaque, seat: ?*wl.Obj, capabilities: u32) call
         app.pointer = pointer;
         if (pointer) |p| wl.addListener(p, &pointer_listener, app);
     }
-    if (capabilities & wl.seat_capability_keyboard != 0 and app.keyboard == null) {
-        app.keyboard_version = @min(app.seat_version, 5);
-        const keyboard = wl.seatGetKeyboard(seat.?, app.keyboard_version);
-        app.keyboard = keyboard;
+    if (capabilities & wl.seat_capability_keyboard != 0 and !app.keyboard_active) {
+        app.keyboard_active = true;
+        const keyboard = wl.seatGetKeyboard(seat.?, @min(app.seat_version, 5));
         if (keyboard) |k| wl.addListener(k, &keyboard_listener, app);
     }
 }
@@ -1074,15 +956,13 @@ fn onXdgLog(data: ?*anyopaque, xdg: ?*wl.Obj, x: i32, y: i32, w: i32, h: i32) ca
     const self: *Output = @ptrCast(@alignCast(data.?));
     self.logical.x = @floatFromInt(x);
     self.logical.y = @floatFromInt(y);
-    if (w > 0) self.logical.w = @floatFromInt(w);
-    if (h > 0) self.logical.h = @floatFromInt(h);
+    self.setLogicalSize(w, h);
 }
 
 fn onXdgSize(data: ?*anyopaque, xdg: ?*wl.Obj, w: i32, h: i32) callconv(.c) void {
     _ = xdg;
     const self: *Output = @ptrCast(@alignCast(data.?));
-    if (w > 0) self.logical.w = @floatFromInt(w);
-    if (h > 0) self.logical.h = @floatFromInt(h);
+    self.setLogicalSize(w, h);
     self.logical_known = true;
 }
 
@@ -1110,8 +990,7 @@ fn onLayerConfigure(
     height: u32,
 ) callconv(.c) void {
     const self: *Output = @ptrCast(@alignCast(data.?));
-    if (width > 0) self.logical.w = @floatFromInt(width);
-    if (height > 0) self.logical.h = @floatFromInt(height);
+    self.setLogicalSize(@intCast(width), @intCast(height));
     wl.layerSurfaceAckConfigure(layer_surface.?, serial);
     self.configured = true;
 }
@@ -1168,8 +1047,7 @@ fn onPointerEnter(
     _ = pointer;
     const app: *App = @ptrCast(@alignCast(data.?));
     if (app.dev_gesture_active) return;
-    app.pointer_serial = serial;
-    app.last_serial = serial;
+    app.serial = serial;
     hideCursor(app);
     const o = outputForSurface(app, surface) orelse return;
     updateCursor(app, o, .{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) });
@@ -1184,12 +1062,11 @@ fn onPointerLeave(
     _ = pointer;
     const app: *App = @ptrCast(@alignCast(data.?));
     if (app.dev_gesture_active) return;
-    app.last_serial = serial;
+    app.serial = serial;
     const o = outputForSurface(app, surface) orelse return;
     if (app.cursor_output == o) app.cursor_output = null;
     if (app.interaction) |*interaction| {
-        const damages = interaction.leaveSurface(o.interaction_id);
-        repaintDamages(app, damages);
+        interaction_mod.paintDamages(interaction.leaveSurface(o.interaction_id), app, paintOutput);
     }
 }
 
@@ -1220,18 +1097,15 @@ fn onPointerButton(
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
     if (app.dev_gesture_active) return;
-    app.last_serial = serial;
-    app.pointer_serial = serial;
+    app.serial = serial;
 
     if (state == wl.button_pressed) {
-        app.buttons += 1;
         if (button == btn_left) {
             if (app.cursor_output != null) beginSelection(app);
         } else if (button == btn_right) {
             cancel(app);
         }
     } else if (state == wl.button_released) {
-        if (app.buttons > 0) app.buttons -= 1;
         const selecting = if (app.interaction) |*interaction| interaction.isSelecting() else false;
         if (button == btn_left and selecting) endSelection(app);
     }
@@ -1278,8 +1152,13 @@ fn onKeyboardKeymap(
     ) catch return;
     defer std.posix.munmap(memory);
 
-    const context = wl.xkb.xkb_context_new(wl.xkb.context_no_flags) orelse return;
-    if (app.xkb_context == null) app.xkb_context = context;
+    // One context for the process; each keymap event replaces the previous
+    // keymap and state, so the old ones are released rather than leaked.
+    const context = app.xkb_context orelse blk: {
+        const created = wl.xkb.xkb_context_new(wl.xkb.context_no_flags) orelse return;
+        app.xkb_context = created;
+        break :blk created;
+    };
     const text: [*:0]const u8 = @ptrCast(memory.ptr);
     const keymap = wl.xkb.xkb_keymap_new_from_string(
         context,
@@ -1287,7 +1166,12 @@ fn onKeyboardKeymap(
         wl.xkb.keymap_format_text_v1,
         wl.xkb.keymap_compile_no_flags,
     ) orelse return;
-    const state = wl.xkb.xkb_state_new(keymap) orelse return;
+    const state = wl.xkb.xkb_state_new(keymap) orelse {
+        wl.xkb.xkb_keymap_unref(keymap);
+        return;
+    };
+    if (app.xkb_state) |previous| wl.xkb.xkb_state_unref(previous);
+    if (app.xkb_keymap) |previous| wl.xkb.xkb_keymap_unref(previous);
     app.xkb_keymap = keymap;
     app.xkb_state = state;
 }
@@ -1303,7 +1187,7 @@ fn onKeyboardKey(
     _ = keyboard;
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
-    app.last_serial = serial;
+    app.serial = serial;
     if (state != wl.button_pressed) return;
 
     var escape = key == 1; // evdev Escape, when no keymap is available

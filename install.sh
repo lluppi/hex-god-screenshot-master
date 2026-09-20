@@ -21,20 +21,12 @@ usage: ./install.sh [APP_DIR]
 EOF
 }
 
-require_zig() {
-	if ! command -v zig >/dev/null; then
-		echo "zig is not on PATH (https://ziglang.org/download/)" >&2
-		exit 1
-	fi
-}
-
-# The version lives in the source, in one line, so the bundle cannot drift from
-# what the binary reports for --version.
-source_version() {
+# What the binary itself reports, so the bundle cannot drift from it.
+built_version() {
 	local found
-	found="$(sed -n 's/.*pub const version = "\([^"]*\)".*/\1/p' src/core/cli.zig)"
+	found="$("zig-out/bin/$EXECUTABLE" --version | awk '{ print $NF }')"
 	if [[ -z "$found" ]]; then
-		echo "cannot read the version out of src/core/cli.zig" >&2
+		echo "cannot read the version out of zig-out/bin/$EXECUTABLE" >&2
 		exit 1
 	fi
 	echo "$found"
@@ -44,7 +36,6 @@ path_hint() {
 	if [[ ":$PATH:" != *":$1:"* ]]; then
 		echo "Add this to your shell config if needed:"
 		echo "  export PATH=\"$1:\$PATH\""
-		echo
 	fi
 }
 
@@ -64,13 +55,10 @@ install_linux() {
 
 install_macos() {
 	local app_name="Hex God Screenshot Master"
-	local signing_identity="$app_name Local Signing"
 	local app_root="${1:-$HOME/Applications}"
 	local app="$app_root/$app_name.app"
 	local launcher="$HOME/.local/bin/$EXECUTABLE"
 	local icon="assets/icon/icon.icns"
-	local version
-	version="$(source_version)"
 
 	if [[ ! -f "$icon" ]]; then
 		echo "$icon is missing: regenerate it with python3 scripts/gen-icon.py" >&2
@@ -79,12 +67,15 @@ install_macos() {
 
 	zig build -Doptimize=ReleaseFast
 
+	local version
+	version="$(built_version)"
+
 	# Screen Recording permission is tied to the app's code requirement, so sign
-	# with a stable local identity rather than ad-hoc. There is no nested code
-	# here, so only the bundle itself is signed.
-	if ! security find-identity -v -p codesigning | grep -Fq "\"$signing_identity\""; then
-		scripts/setup-local-signing.sh >/dev/null
-	fi
+	# with a stable local identity rather than ad-hoc. The signing script creates
+	# one if needed and prints the name to use; there is no nested code here, so
+	# only the bundle itself is signed.
+	local signing_identity
+	signing_identity="$(scripts/setup-local-signing.sh)"
 
 	rm -rf "$app"
 	mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -181,7 +172,10 @@ if [[ $# -gt 0 ]]; then
 	fi
 fi
 
-require_zig
+if ! command -v zig >/dev/null; then
+	echo "zig is not on PATH (https://ziglang.org/download/)" >&2
+	exit 1
+fi
 
 if [[ "$os" == macos ]]; then
 	install_macos "$@"
