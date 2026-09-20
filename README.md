@@ -26,7 +26,7 @@ beyond libc, `libwayland-client` and `libxkbcommon` on Linux.
 ```sh
 git clone git@github.com:lluppi/hex-god-screenshot-master.git
 cd hex-god-screenshot-master
-./install.sh   # to ~/.local/bin, override with PREFIX=...
+./install.sh   # detects the platform; to ~/.local/bin, override with PREFIX=...
 ```
 
 Bind it in your compositor, for example Hyprland:
@@ -41,7 +41,7 @@ Hyprland provide. GNOME and KDE Wayland do not; the tool says so and exits.
 ### macOS
 
 ```sh
-./install-macos.sh   # Release build, .app with stable local signing, launcher
+./install.sh [APP_DIR]   # .app with stable local signing + launcher (default ~/Applications)
 ```
 
 On first launch grant **Screen & System Audio Recording**, then launch again.
