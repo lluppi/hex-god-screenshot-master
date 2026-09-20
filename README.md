@@ -36,11 +36,20 @@ hyprland provide. gnome and kde wayland do not - says so and exits
 ### macos
 
 ```sh
-./install.sh [APP_DIR]   # .app with stable local signing + launcher (default ~/Applications)
+./install.sh    # into ~/.local/bin
 ```
 
-on first launch grant **Screen & System Audio Recording**, then launch again
-point raycast, aerospace, or a shortcut at the launcher
+the overlay is a single binary, so macOS attributes Screen Recording to whatever
+process launches it, not to `hgsm` itself. grant **Screen & System Audio
+Recording** to that launcher - your terminal, and your window manager if you bind
+it to a key - then start `hgsm` from there. macOS does not prompt for this, and
+Finder, Spotlight and the dock have no grant at all.
+
+bind it in your window manager, for example aerospace:
+
+```toml
+cmd-s = 'exec-and-forget ~/.local/bin/hgsm'
+```
 
 ## command line
 
