@@ -59,17 +59,25 @@ extern "c" fn class_addMethod(cls: ?*anyopaque, name: SEL, imp: IMP, types: [*:0
 extern "c" fn objc_msgSend() void;
 
 /// Look up a class by name, cached per call site.
+///
+/// The cache lives in a container declared here, which *must* capture `name`.
+/// Without `key`, every instantiation of this container is structurally
+/// identical, Zig interns them into a single type, and all names would share
+/// one slot -- so a second `class(...)` would return the first class looked up.
 pub fn class(comptime name: [*:0]const u8) Class {
     const Cache = struct {
+        const key = name;
         var value: Class = null;
     };
     if (Cache.value == null) Cache.value = objc_getClass(name);
     return Cache.value;
 }
 
-/// Register a selector, cached per call site.
+/// Register a selector, cached per call site. Same container-capture rule as
+/// `class`: without `key` every `sel(...)` would return the first selector.
 pub fn sel(comptime name: [*:0]const u8) SEL {
     const Cache = struct {
+        const key = name;
         var value: SEL = null;
     };
     if (Cache.value == null) Cache.value = sel_registerName(name);
