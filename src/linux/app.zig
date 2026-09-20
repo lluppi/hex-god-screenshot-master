@@ -35,6 +35,11 @@ const namespace = "hgsm";
 const btn_left: u32 = 0x110;
 const btn_right: u32 = 0x111;
 
+/// evdev keycodes, for when no keymap has arrived and no keysym can be named.
+const evdev_escape: u32 = 1;
+const evdev_shift_l: u32 = 42;
+const evdev_shift_r: u32 = 54;
+
 /// Synthetic gestures for development: they drive the very same functions the
 /// pointer handlers call, so a click or a drag can be exercised (and screenshoted
 /// mid selection) without a mouse or an input injector on the box.
@@ -99,12 +104,41 @@ pub const App = struct {
     xdg_manager: ?*wl.Obj = null,
     xdg_manager_version: u32 = 3,
     viewporter: ?*wl.Obj = null,
+    constraints: ?*wl.Obj = null,
+    constraints_version: u32 = 1,
+    relative_pointer_manager: ?*wl.Obj = null,
+    relative_pointer_manager_version: u32 = 1,
     data_device_manager: ?*wl.Obj = null,
     data_device_manager_version: u32 = 1,
     seat: ?*wl.Obj = null,
     seat_version: u32 = 1,
     pointer: ?*wl.Obj = null,
     pointer_version: u32 = 1,
+    /// Raw, unquantised pointer deltas. Null when the compositor has no
+    /// relative-pointer, in which case the cursor stays on the compositor's own
+    /// (integer logical pixel) positions.
+    relative_pointer: ?*wl.Obj = null,
+    /// The lock meant to park the real pointer, once one has been requested.
+    locked_pointer: ?*wl.Obj = null,
+    /// Output surface the current lock belongs to, used to restore the real
+    /// pointer under the fine cursor before releasing it.
+    locked_output: ?*Output = null,
+    /// Logical pixels of cursor movement per unit of raw delta, from `--gain`.
+    /// Zero means the compositor's own cursor position drives the overlay.
+    gain: f64 = 0.5,
+    /// The compositor reported the lock active. It does not follow that the
+    /// pointer is held where it was; see `onPointerLocked`.
+    pinned: bool = false,
+    /// The axis (and value) of the last `wl_pointer.axis`, which is what tells a
+    /// `axis_discrete` with no step count which way the wheel turned.
+    pending_axis: u32 = 0,
+    pending_axis_value: f64 = 0,
+    /// Shift swaps the scroll axes; the keyboard reports it, so it is tracked
+    /// here instead of through the xkb modifier state.
+    shift_down: bool = false,
+    /// The fine cursor has seen its first batch of deltas, which is the point
+    /// where the lock can be re-asked for if it never reported in.
+    fine_started: bool = false,
     /// A keyboard is created only once, however often capabilities are announced.
     keyboard_active: bool = false,
     data_device: ?*wl.Obj = null,
@@ -183,7 +217,13 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
         std.process.exit(1);
     };
 
-    var app = App{ .allocator = allocator, .display = display };
+    var app = App{
+        .allocator = allocator,
+        .display = display,
+        // A synthetic gesture drives the cursor directly, so it must not have a
+        // raw-delta cursor racing it.
+        .gain = if (dev != .none) 0 else invocation.gain,
+    };
     defer wl.wl_display_disconnect(display);
     defer if (app.clip_source) |source| wl.dataSourceDestroy(source);
 
@@ -207,6 +247,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                     },
                 );
             }
+            out.print("fine pointer: {s}\n", .{finePointerSupport(&app)});
         },
         .pick => |point| {
             const rgb = interaction_mod.colorAt(app.surfaces, point) orelse {
@@ -299,6 +340,13 @@ fn connect(self: *App) !void {
             };
         }
     }
+}
+
+/// What the compositor offers for the fine cursor, for `--info`.
+fn finePointerSupport(self: *App) []const u8 {
+    if (self.relative_pointer_manager == null) return "none";
+    if (self.constraints == null) return "relative-pointer";
+    return "relative-pointer + pointer-constraints";
 }
 
 fn roundtrip(self: *App) !void {
@@ -436,6 +484,10 @@ fn startOverlay(self: *App) !void {
 }
 
 fn teardownOverlay(self: *App) void {
+    // Release the pointer before anything else: the screenshot capture that
+    // follows wants the desktop back to normal.
+    releaseLock(self);
+    self.fine_started = false;
     for (self.outputs.items) |o| {
         if (o.layer_surface) |layer_surface| wl.layerSurfaceDestroy(layer_surface);
         if (o.surface) |surface| wl.surfaceDestroy(surface);
@@ -862,6 +914,12 @@ fn onRegistryGlobal(
 
     if (std.mem.eql(u8, iface, "wp_viewporter")) {
         app.viewporter = wl.bind(registry_obj, name, &wl.wp_viewporter_interface, @min(version, 1));
+    } else if (std.mem.eql(u8, iface, "zwp_pointer_constraints_v1")) {
+        app.constraints_version = @min(version, 1);
+        app.constraints = wl.bind(registry_obj, name, &wl.zwp_pointer_constraints_v1_interface, app.constraints_version);
+    } else if (std.mem.eql(u8, iface, "zwp_relative_pointer_manager_v1")) {
+        app.relative_pointer_manager_version = @min(version, 1);
+        app.relative_pointer_manager = wl.bind(registry_obj, name, &wl.zwp_relative_pointer_manager_v1_interface, app.relative_pointer_manager_version);
     } else if (std.mem.eql(u8, iface, "wl_seat")) {
         app.seat_version = @min(version, 5);
         const seat = wl.bind(registry_obj, name, &wl.wl_seat_interface, app.seat_version);
@@ -894,6 +952,19 @@ fn onSeatCapabilities(data: ?*anyopaque, seat: ?*wl.Obj, capabilities: u32) call
         const pointer = wl.seatGetPointer(seat.?, app.pointer_version);
         app.pointer = pointer;
         if (pointer) |p| wl.addListener(p, &pointer_listener, app);
+
+        // Relative motion is a property of the pointer object, so it can only be
+        // asked for once the seat has handed one over.
+        if (pointer) |p| {
+            if (app.relative_pointer_manager) |manager| {
+                app.relative_pointer = wl.relativePointerManagerGetRelativePointer(
+                    manager,
+                    app.relative_pointer_manager_version,
+                    p,
+                );
+                if (app.relative_pointer) |rp| wl.addListener(rp, &relative_pointer_listener, app);
+            }
+        }
     }
     if (capabilities & wl.seat_capability_keyboard != 0 and !app.keyboard_active) {
         app.keyboard_active = true;
@@ -1006,11 +1077,11 @@ const PointerListener = extern struct {
     leave: *const fn (?*anyopaque, ?*wl.Obj, u32, ?*wl.Obj) callconv(.c) void,
     motion: *const fn (?*anyopaque, ?*wl.Obj, u32, i32, i32) callconv(.c) void,
     button: *const fn (?*anyopaque, ?*wl.Obj, u32, u32, u32, u32) callconv(.c) void,
-    axis: *const fn () callconv(.c) void,
-    frame: *const fn () callconv(.c) void,
+    axis: *const fn (?*anyopaque, ?*wl.Obj, u32, u32, i32) callconv(.c) void,
+    frame: *const fn (?*anyopaque, ?*wl.Obj) callconv(.c) void,
     axis_source: *const fn () callconv(.c) void,
     axis_stop: *const fn () callconv(.c) void,
-    axis_discrete: *const fn () callconv(.c) void,
+    axis_discrete: *const fn (?*anyopaque, ?*wl.Obj, u32, i32) callconv(.c) void,
     axis_value120: *const fn () callconv(.c) void,
     axis_relative_direction: *const fn () callconv(.c) void,
 };
@@ -1020,14 +1091,180 @@ const pointer_listener = PointerListener{
     .leave = onPointerLeave,
     .motion = onPointerMotion,
     .button = onPointerButton,
-    .axis = @ptrCast(&wl.noop),
+    .axis = onPointerAxis,
     .frame = @ptrCast(&wl.noop),
     .axis_source = @ptrCast(&wl.noop),
     .axis_stop = @ptrCast(&wl.noop),
-    .axis_discrete = @ptrCast(&wl.noop),
+    .axis_discrete = onPointerDiscreteAxis,
     .axis_value120 = @ptrCast(&wl.noop),
     .axis_relative_direction = @ptrCast(&wl.noop),
 };
+
+/// `zwp_relative_pointer_v1.relative_motion`: two `u32` timestamps, then the
+/// accelerated and unaccelerated deltas as `wl_fixed_t`. The accelerated pair is
+/// what the compositor would have moved its own cursor by, so it keeps whatever
+/// the pointer itself is configured to do; the unaccelerated pair is only used
+/// when the compositor sends nothing accelerated.
+const RelativePointerListener = extern struct {
+    relative_motion: *const fn (
+        ?*anyopaque,
+        ?*wl.Obj,
+        u32,
+        u32,
+        i32,
+        i32,
+        i32,
+        i32,
+    ) callconv(.c) void,
+};
+
+const relative_pointer_listener = RelativePointerListener{
+    .relative_motion = onRelativeMotion,
+};
+
+const LockedPointerListener = extern struct {
+    locked: *const fn (?*anyopaque, ?*wl.Obj) callconv(.c) void,
+    unlocked: *const fn (?*anyopaque, ?*wl.Obj) callconv(.c) void,
+};
+
+const locked_pointer_listener = LockedPointerListener{
+    .locked = onPointerLocked,
+    .unlocked = onPointerUnlocked,
+};
+
+/// The compositor reported the lock active. The fine cursor does not depend on
+/// this either way; it only says whether the real pointer is meant to be parked,
+/// which is what keeps it where the user left it once the overlay is gone.
+/// Hyprland reports it for layer surfaces without actually holding the pointer,
+/// so nothing here may claim more than the event does.
+fn onPointerLocked(data: ?*anyopaque, locked: ?*wl.Obj) callconv(.c) void {
+    _ = locked;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.pinned = true;
+}
+
+fn onPointerUnlocked(data: ?*anyopaque, locked: ?*wl.Obj) callconv(.c) void {
+    _ = locked;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.pinned = false;
+}
+
+/// Relative motion belongs to its own protocol stream and is not coupled to
+/// `wl_pointer.frame`, so apply each event as it arrives.
+fn onRelativeMotion(
+    data: ?*anyopaque,
+    relative_pointer: ?*wl.Obj,
+    time_hi: u32,
+    time_lo: u32,
+    dx: i32,
+    dy: i32,
+    dx_unaccel: i32,
+    dy_unaccel: i32,
+) callconv(.c) void {
+    _ = relative_pointer;
+    _ = time_hi;
+    _ = time_lo;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    if (app.dev_gesture_active) return;
+
+    const accelerated = dx != 0 or dy != 0;
+    advanceFineCursor(app, .{
+        .x = wl.fixedToFloat(if (accelerated) dx else dx_unaccel),
+        .y = wl.fixedToFloat(if (accelerated) dy else dy_unaccel),
+    });
+}
+
+/// Move the fine cursor by one batch of raw deltas and repaint what changed.
+fn advanceFineCursor(self: *App, delta: Point) void {
+    const interaction = prepareFineMove(self) orelse return;
+    interaction_mod.paintDamages(interaction.advanceFine(delta), self, paintOutput);
+}
+
+fn nudgeFineCursor(self: *App, delta: Point) void {
+    const interaction = prepareFineMove(self) orelse return;
+    interaction_mod.paintDamages(interaction.nudgeFine(delta), self, paintOutput);
+}
+
+fn prepareFineMove(self: *App) ?*interaction_mod.Interaction {
+    const interaction = &(self.interaction orelse return null);
+    if (!interaction.fineActive()) return null;
+    if (!self.fine_started) {
+        self.fine_started = true;
+        // A compositor only activates a fresh constraint whose surface already
+        // holds focus, and the pointer enter that asked for it can beat that
+        // focus. Deltas are flowing here, so the focus is certainly ours by now:
+        // a lock that never reported in gets dropped and asked for once more.
+        if (!self.pinned) relockFine(self);
+    }
+    return interaction;
+}
+
+/// Ask for the lock again, parked under the fine cursor rather than under a
+/// pointer position the user has already moved on from.
+fn relockFine(self: *App) void {
+    const interaction = &(self.interaction orelse return);
+    const global = interaction.finePosition() orelse return;
+    const hit = interaction_mod.hitTest(self.surfaces, global) orelse return;
+    releaseLock(self);
+    requestLock(self, self.outputs.items[hit.surface], hit.local);
+}
+
+/// The value of a `wl_pointer.axis` event, kept so a `axis_discrete` that
+/// arrives without a step count still knows which way the wheel turned.
+fn onPointerAxis(
+    data: ?*anyopaque,
+    pointer: ?*wl.Obj,
+    time: u32,
+    axis: u32,
+    value: i32,
+) callconv(.c) void {
+    _ = pointer;
+    _ = time;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.pending_axis = axis;
+    app.pending_axis_value = wl.fixedToFloat(value);
+}
+
+/// One wheel detent is one physical pixel of cursor movement, which is the only
+/// step that is exactly one cell of the loupe's grid at every display scale.
+fn onPointerDiscreteAxis(
+    data: ?*anyopaque,
+    pointer: ?*wl.Obj,
+    axis: u32,
+    discrete: i32,
+) callconv(.c) void {
+    _ = pointer;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    if (app.dev_gesture_active) return;
+
+    const interaction = &(app.interaction orelse return);
+    const global = interaction.finePosition() orelse return;
+    const hit = interaction_mod.hitTest(app.surfaces, global) orelse return;
+    const o = app.outputs.items[hit.surface];
+
+    const steps = std.math.clamp(discrete, -10, 10);
+    const direction: f64 = if (steps != 0)
+        @floatFromInt(steps)
+    else if (app.pending_axis == axis and app.pending_axis_value > 0)
+        1
+    else if (app.pending_axis == axis and app.pending_axis_value < 0)
+        -1
+    else
+        return;
+
+    // Shift swaps the axes, since a compositor hands shift+wheel over as a plain
+    // vertical scroll.
+    const scroll_axis = if (app.shift_down)
+        if (axis == wl.axis_vertical) wl.axis_horizontal else wl.axis_vertical
+    else
+        axis;
+    const step = direction / o.scale;
+    const delta = if (scroll_axis == wl.axis_horizontal)
+        Point{ .x = step, .y = 0 }
+    else
+        Point{ .x = 0, .y = step };
+    nudgeFineCursor(app, delta);
+}
 
 fn outputForSurface(app: *App, surface: ?*wl.Obj) ?*Output {
     for (app.outputs.items) |o| {
@@ -1050,7 +1287,71 @@ fn onPointerEnter(
     app.serial = serial;
     hideCursor(app);
     const o = outputForSurface(app, surface) orelse return;
-    updateCursor(app, o, .{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) });
+    const local = Point{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) };
+    if (app.interaction) |*interaction| {
+        if (interaction.fineActive()) return;
+    }
+    updateCursor(app, o, local);
+    beginFineCursor(app, o, local);
+    requestLock(app, o, local);
+}
+
+/// Hand the cursor over to raw deltas, anchored on the point the compositor
+/// currently reports, so taking over moves nothing on the first frame.
+fn beginFineCursor(self: *App, o: *Output, local: Point) void {
+    const interaction = &(self.interaction orelse return);
+    if (self.gain <= 0 or self.relative_pointer == null) return;
+    interaction.beginFine(
+        .{ .x = o.logical.x + local.x, .y = o.logical.y + local.y },
+        self.gain,
+    );
+}
+
+/// Ask for the real pointer to be parked for the duration of the overlay. The
+/// fine cursor is driven by relative deltas either way, so this is only about
+/// the pointer not wandering off while the overlay is up, and being where the
+/// user left it once the overlay is gone.
+fn requestLock(self: *App, o: *Output, local: Point) void {
+    const constraints = self.constraints orelse return;
+    const pointer = self.pointer orelse return;
+    const surface = o.surface orelse return;
+    if (self.gain <= 0 or self.relative_pointer == null) return;
+    if (self.locked_pointer != null) return;
+
+    const locked = wl.constraintsLockPointer(
+        constraints,
+        self.constraints_version,
+        surface,
+        pointer,
+        wl.constraint_lifetime_persistent,
+    ) orelse return;
+    // Where the pointer already is, so the lock does not teleport it.
+    wl.lockedPointerSetCursorPositionHint(locked, local.x, local.y);
+    wl.surfaceCommit(surface);
+    wl.addListener(locked, &locked_pointer_listener, self);
+    self.locked_pointer = locked;
+    self.locked_output = o;
+}
+
+/// Commit the fine cursor as the unlock position, then release the constraint.
+fn releaseLock(self: *App) void {
+    const locked = self.locked_pointer orelse return;
+    if (self.locked_output) |o| {
+        if (self.interaction) |*interaction| {
+            if (interaction.finePosition()) |global| {
+                wl.lockedPointerSetCursorPositionHint(
+                    locked,
+                    global.x - o.logical.x,
+                    global.y - o.logical.y,
+                );
+                if (o.surface) |surface| wl.surfaceCommit(surface);
+            }
+        }
+    }
+    wl.lockedPointerDestroy(locked);
+    self.locked_pointer = null;
+    self.locked_output = null;
+    self.pinned = false;
 }
 
 fn onPointerLeave(
@@ -1064,6 +1365,11 @@ fn onPointerLeave(
     if (app.dev_gesture_active) return;
     app.serial = serial;
     const o = outputForSurface(app, surface) orelse return;
+    if (app.interaction) |*interaction| {
+        // The fine cursor is not the compositor's pointer, so the real one
+        // wandering off a surface neither moves it nor hides it.
+        if (interaction.fineActive()) return;
+    }
     if (app.cursor_output == o) app.cursor_output = null;
     if (app.interaction) |*interaction| {
         interaction_mod.paintDamages(interaction.leaveSurface(o.interaction_id), app, paintOutput);
@@ -1081,6 +1387,12 @@ fn onPointerMotion(
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
     if (app.dev_gesture_active) return;
+    if (app.interaction) |*interaction| {
+        // Those positions are quantised to whole logical pixels, which is more
+        // than one physical pixel on a fractional-scaled output. The fine cursor
+        // is driven by deltas instead, so this stream is not allowed to fight it.
+        if (interaction.fineActive()) return;
+    }
     const o = app.cursor_output orelse return;
     updateCursor(app, o, .{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) });
 }
@@ -1188,14 +1500,35 @@ fn onKeyboardKey(
     _ = time;
     const app: *App = @ptrCast(@alignCast(data.?));
     app.serial = serial;
-    if (state != wl.button_pressed) return;
+    const pressed = state == wl.button_pressed;
+    const sym: u32 = if (app.xkb_state) |xkb_state|
+        wl.xkb.xkb_state_key_get_one_sym(xkb_state, key + wl.xkb.keycode_offset)
+    else
+        0;
 
-    var escape = key == 1; // evdev Escape, when no keymap is available
-    if (app.xkb_state) |xkb_state| {
-        const sym = wl.xkb.xkb_state_key_get_one_sym(xkb_state, key + wl.xkb.keycode_offset);
-        escape = sym == wl.xkb.keysym_escape;
+    if (sym == wl.xkb.keysym_shift_l or sym == wl.xkb.keysym_shift_r or
+        (sym == 0 and (key == evdev_shift_l or key == evdev_shift_r)))
+    {
+        app.shift_down = pressed;
+        return;
     }
-    if (escape) cancel(app);
+    if (!pressed) return;
+
+    if (sym == wl.xkb.keysym_escape or (sym == 0 and key == evdev_escape)) {
+        cancel(app);
+    } else if (sym == wl.xkb.keysym_minus) {
+        adjustGain(app, 1 / cli.gain_step);
+    } else if (sym == wl.xkb.keysym_equal or sym == wl.xkb.keysym_plus) {
+        adjustGain(app, cli.gain_step);
+    }
+}
+
+/// Change the fine cursor's speed on the fly, so it can be found by feel rather
+/// than by re-running with another `--gain`.
+fn adjustGain(self: *App, factor: f64) void {
+    const interaction = &(self.interaction orelse return);
+    self.gain = cli.adjustedGain(self.gain, factor);
+    interaction.setFineGain(self.gain);
 }
 
 const DataSourceListener = extern struct {

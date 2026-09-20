@@ -66,6 +66,8 @@ fn linkPlatform(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.
                     "protocol/generated/viewporter.c",
                     "protocol/generated/wlr-layer-shell-unstable-v1.c",
                     "protocol/generated/wlr-screencopy-unstable-v1.c",
+                    "protocol/generated/pointer-constraints-unstable-v1.c",
+                    "protocol/generated/relative-pointer-unstable-v1.c",
                 },
                 .flags = &.{ "-std=gnu11", "-Wno-unused-parameter" },
             });

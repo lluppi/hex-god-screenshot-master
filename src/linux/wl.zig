@@ -82,6 +82,10 @@ pub extern const zxdg_output_manager_v1_interface: Interface;
 pub extern const zxdg_output_v1_interface: Interface;
 pub extern const wp_viewporter_interface: Interface;
 pub extern const wp_viewport_interface: Interface;
+pub extern const zwp_pointer_constraints_v1_interface: Interface;
+pub extern const zwp_locked_pointer_v1_interface: Interface;
+pub extern const zwp_relative_pointer_manager_v1_interface: Interface;
+pub extern const zwp_relative_pointer_v1_interface: Interface;
 
 pub const shm_format_argb8888: u32 = 0;
 pub const shm_format_xrgb8888: u32 = 1;
@@ -91,6 +95,9 @@ pub const seat_capability_pointer: u32 = 1;
 pub const seat_capability_keyboard: u32 = 2;
 pub const keyboard_keymap_format_xkb_v1: u32 = 1;
 
+pub const axis_vertical: u32 = 0;
+pub const axis_horizontal: u32 = 1;
+
 pub const layer_overlay: u32 = 2;
 
 pub const anchor_top: u32 = 1;
@@ -98,8 +105,19 @@ pub const anchor_left: u32 = 4;
 
 pub const keyboard_interactivity_exclusive: u32 = 1;
 
+/// `zwp_pointer_constraints_v1.lifetime`. A oneshot constraint is defunct the
+/// moment it deactivates, which is exactly what happens whenever the pointer
+/// focus moves; the fine cursor has to survive that, so it asks for persistent.
+pub const constraint_lifetime_oneshot: u32 = 1;
+pub const constraint_lifetime_persistent: u32 = 2;
+
 pub fn fixedToFloat(value: i32) f64 {
     return @as(f64, @floatFromInt(value)) / 256.0;
+}
+
+/// The inverse, for the requests that take `wl_fixed_t`.
+pub fn floatToFixed(value: f64) i32 {
+    return @intFromFloat(@round(value * 256.0));
 }
 
 /// Flush outgoing requests, wait up to `timeout_ms` for events, and dispatch
@@ -412,6 +430,57 @@ pub fn viewportSetDestination(viewport: *Obj, width: i32, height: i32) void {
     request(viewport, 2, &args);
 }
 
+// ---------------------------------------------------------------------------
+// pointer lock and relative motion
+// ---------------------------------------------------------------------------
+
+/// `zwp_relative_pointer_manager_v1.get_relative_pointer`: the deltas this
+/// returns are the raw ones, before the compositor quantises the pointer to
+/// whole logical pixels, which is what makes a per-pixel cursor possible.
+pub fn relativePointerManagerGetRelativePointer(
+    manager: *Obj,
+    version: u32,
+    pointer: *Obj,
+) ?*Obj {
+    var args = [_]Argument{ .{ .n = 0 }, .{ .o = pointer } };
+    return requestNew(manager, 1, &zwp_relative_pointer_v1_interface, version, &args);
+}
+
+pub fn relativePointerDestroy(relative_pointer: *Obj) void {
+    requestDestroy(relative_pointer, 0, &no_args);
+}
+
+/// `zwp_pointer_constraints_v1.lock_pointer`: pin the real pointer. `region`
+/// stays null, which the protocol reads as the whole surface.
+pub fn constraintsLockPointer(
+    constraints: *Obj,
+    version: u32,
+    surface: *Obj,
+    pointer: *Obj,
+    lifetime: u32,
+) ?*Obj {
+    var args = [_]Argument{
+        .{ .n = 0 },
+        .{ .o = surface },
+        .{ .o = pointer },
+        .{ .o = null },
+        .{ .u = lifetime },
+    };
+    return requestNew(constraints, 1, &zwp_locked_pointer_v1_interface, version, &args);
+}
+
+/// Where the pointer should sit while it is locked, relative to the surface's
+/// top left. Without it the compositor parks it wherever it was when the lock
+/// was requested, which is not necessarily where the user is looking.
+pub fn lockedPointerSetCursorPositionHint(locked: *Obj, x: f64, y: f64) void {
+    var args = [_]Argument{ .{ .i = floatToFixed(x) }, .{ .i = floatToFixed(y) } };
+    request(locked, 1, &args);
+}
+
+pub fn lockedPointerDestroy(locked: *Obj) void {
+    requestDestroy(locked, 0, &no_args);
+}
+
 /// Add a listener, casting the listener struct to the function-pointer array
 /// libwayland expects.
 pub fn addListener(proxy: *Obj, listener: *align(8) const anyopaque, data: *anyopaque) void {
@@ -462,4 +531,9 @@ pub const xkb = struct {
     /// XKB keycode = evdev keycode + 8; Escape is evdev 1.
     pub const keycode_offset: u32 = 8;
     pub const keysym_escape: u32 = 0xff1b;
+    pub const keysym_shift_l: u32 = 0xffe1;
+    pub const keysym_shift_r: u32 = 0xffe2;
+    pub const keysym_minus: u32 = 0x2d;
+    pub const keysym_equal: u32 = 0x3d;
+    pub const keysym_plus: u32 = 0x2b;
 };

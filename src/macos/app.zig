@@ -62,6 +62,10 @@ const App = struct {
     /// between AppKit's y-up space and the core's y-down space.
     main_max_y: f64 = 0,
     interaction: ?interaction_mod.Interaction = null,
+    /// Logical pixels of cursor movement per unit of the mouse's own delta, from
+    /// `--gain`. Zero keeps the pointer driving the cursor, as it always did.
+    gain: f64 = 0,
+    pointer_detached: bool = false,
     finished: bool = false,
     exit_code: u8 = 0,
 };
@@ -106,7 +110,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
     const command = invocation.command;
     const dev = invocation.dev;
 
-    var app = App{ .allocator = allocator };
+    var app = App{ .allocator = allocator, .gain = invocation.gain };
 
     // NSApplication first: NSScreen is only populated once it exists.
     const application = objc.msgSend(id, objc.class("NSApplication"), objc.sel("sharedApplication"), .{});
@@ -161,9 +165,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             }
             hideCursor();
             defer showCursor();
+            defer releasePointer(&app);
             current_app = &app;
             objc.msgSend(void, application, objc.sel("activateIgnoringOtherApps:"), .{true});
-            updateHoverFromMouse(&app);
+            if (updateHoverFromMouse(&app)) |global| _ = beginFinePointer(&app, global);
             objc.msgSend(void, application, objc.sel("run"), .{});
             current_app = null;
         },
@@ -264,6 +269,7 @@ fn printInfo(app: *App) void {
             },
         );
     }
+    out.print("fine pointer: mouse deltas\n", .{});
 }
 
 fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !Canvas {
@@ -301,17 +307,7 @@ fn startOverlay(app: *App) !void {
     const window_class = windowClass();
     if (view_class == null or window_class == null) return error.ClassRegistrationFailed;
 
-    const surfaces = try app.allocator.alloc(interaction_mod.Surface, app.displays.items.len);
-    defer app.allocator.free(surfaces);
-    for (app.displays.items, 0..) |display, index| {
-        display.interaction_id = index;
-        surfaces[index] = .{
-            .logical = display.logical,
-            .scale = display.scale,
-            .baseline = &display.baseline.?,
-        };
-    }
-    app.interaction = try interaction_mod.Interaction.init(app.allocator, surfaces);
+    app.interaction = try interaction_mod.Interaction.init(app.allocator, app.surfaces);
     errdefer {
         app.interaction.?.deinit();
         app.interaction = null;
@@ -435,12 +431,16 @@ fn endSelection(app: *App) void {
 fn cancel(app: *App) void {
     if (app.finished or !app.interaction.?.cancel()) return;
     app.finished = true;
+    releasePointer(app);
     terminate();
 }
 
 fn finish(app: *App, result: interaction_mod.Result) void {
     if (app.finished) return;
     app.finished = true;
+    // Before the capture, not just before exit: the screenshot wants the desktop
+    // back to normal, pointer included.
+    releasePointer(app);
 
     switch (result) {
         .color => |point| {
@@ -510,11 +510,12 @@ fn captureOne(app: *App, surface: interaction_mod.SurfaceId, intersection: FRect
     return canvasFromImage(app.allocator, image);
 }
 
-fn updateHoverFromMouse(app: *App) void {
+fn updateHoverFromMouse(app: *App) ?Point {
     const location = objc.msgSend(objc.CGPoint, objc.class("NSEvent"), objc.sel("mouseLocation"), .{});
     const global = Point{ .x = location.x, .y = app.main_max_y - location.y };
-    const hit = interaction_mod.hitTest(app.surfaces, global) orelse return;
+    const hit = interaction_mod.hitTest(app.surfaces, global) orelse return null;
     updateCursor(app, app.displays.items[hit.surface], hit.local);
+    return global;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +578,7 @@ fn viewClass() objc.Class {
             .{ .name = "mouseDragged:", .imp = @ptrCast(&viewMouseDragged), .types = "v@:@" },
             .{ .name = "mouseUp:", .imp = @ptrCast(&viewMouseUp), .types = "v@:@" },
             .{ .name = "rightMouseDown:", .imp = @ptrCast(&viewRightMouseDown), .types = "v@:@" },
+            .{ .name = "scrollWheel:", .imp = @ptrCast(&viewScrollWheel), .types = "v@:@" },
             .{ .name = "keyDown:", .imp = @ptrCast(&viewKeyDown), .types = "v@:@" },
         };
     };
@@ -697,18 +699,74 @@ fn viewPoint(display: *Display, event: id) Point {
     return .{ .x = window_point.x, .y = display.logical.h - window_point.y };
 }
 
+/// Where the cursor goes for one mouse event: the fine cursor moves by the
+/// event's own deltas, or the compositor's pointer position moves it directly.
+fn mouseMoved(app: *App, display: *Display, event: id) void {
+    if (fineStep(app, display, event)) return;
+    updateCursor(app, display, viewPoint(display, event));
+}
+
+/// Advance the fine cursor from a mouse event, taking the pointer over on the
+/// first move. Returns false when there is no fine cursor to advance, which
+/// leaves the caller with the plain cursor position.
+fn fineStep(app: *App, display: *Display, event: id) bool {
+    const interaction = &(app.interaction orelse return false);
+    if (app.gain <= 0) return false;
+
+    if (!interaction.fineActive()) {
+        const local = viewPoint(display, event);
+        return beginFinePointer(
+            app,
+            .{ .x = display.logical.x + local.x, .y = display.logical.y + local.y },
+        );
+    }
+
+    const delta = Point{
+        .x = objc.msgSend(f64, event, objc.sel("deltaX"), .{}),
+        .y = objc.msgSend(f64, event, objc.sel("deltaY"), .{}),
+    };
+    if (delta.x == 0 and delta.y == 0) return true;
+    interaction_mod.paintDamages(interaction.advanceFine(delta), app, paintDisplay);
+    return true;
+}
+
+/// One wheel detent is one physical pixel of cursor movement, the same rule the
+/// linux frontend applies to `axis_discrete`. A trackpad's smooth scrolling
+/// rounds to nothing and is ignored.
+fn viewScrollWheel(self: id, cmd: SEL, event: id) callconv(.c) void {
+    _ = self;
+    _ = cmd;
+    const app = current_app orelse return;
+    const interaction = &(app.interaction orelse return);
+    if (!interaction.fineActive()) return;
+    const global = interaction.finePosition() orelse return;
+    const hit = interaction_mod.hitTest(app.surfaces, global) orelse return;
+    const display = app.displays.items[hit.surface];
+
+    const scroll_x = objc.msgSend(f64, event, objc.sel("scrollingDeltaX"), .{});
+    const scroll_y = objc.msgSend(f64, event, objc.sel("scrollingDeltaY"), .{});
+    const steps_x = std.math.clamp(@round(scroll_x), -10, 10);
+    const steps_y = std.math.clamp(@round(scroll_y), -10, 10);
+    if (steps_x == 0 and steps_y == 0) return;
+
+    interaction_mod.paintDamages(interaction.nudgeFine(.{
+        .x = steps_x / display.scale,
+        .y = steps_y / display.scale,
+    }), app, paintDisplay);
+}
+
 fn viewMouseMoved(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    updateCursor(app, display, viewPoint(display, event));
+    mouseMoved(app, display, event);
 }
 
 fn viewMouseDown(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    updateCursor(app, display, viewPoint(display, event));
+    mouseMoved(app, display, event);
     beginSelection(app);
 }
 
@@ -716,14 +774,14 @@ fn viewMouseDragged(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    updateCursor(app, display, viewPoint(display, event));
+    mouseMoved(app, display, event);
 }
 
 fn viewMouseUp(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    updateCursor(app, display, viewPoint(display, event));
+    mouseMoved(app, display, event);
     if (app.interaction.?.isSelecting()) endSelection(app);
 }
 
@@ -740,7 +798,41 @@ fn viewKeyDown(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const keycode = objc.msgSend(u16, event, objc.sel("keyCode"), .{});
-    if (keycode == objc.escape_keycode) cancel(app);
+    if (keycode == objc.escape_keycode) {
+        cancel(app);
+    } else if (keycode == objc.minus_keycode) {
+        adjustGain(app, 1 / cli.gain_step);
+    } else if (keycode == objc.equal_keycode) {
+        adjustGain(app, cli.gain_step);
+    }
+}
+
+/// Change the fine cursor's speed on the fly, so it can be found by feel rather
+/// than by re-running with another `--gain`.
+fn adjustGain(app: *App, factor: f64) void {
+    app.gain = cli.adjustedGain(app.gain, factor);
+    if (app.interaction) |*interaction| interaction.setFineGain(app.gain);
+}
+
+fn beginFinePointer(app: *App, global: Point) bool {
+    if (app.gain <= 0) return false;
+    const interaction = &(app.interaction orelse return false);
+    interaction.beginFine(global, app.gain);
+    _ = objc.CGAssociateMouseAndMouseCursorPosition(0);
+    app.pointer_detached = true;
+    return true;
+}
+
+/// Put the system cursor under the fine cursor before reconnecting the mouse.
+fn releasePointer(app: *App) void {
+    if (!app.pointer_detached) return;
+    if (app.interaction) |*interaction| {
+        if (interaction.finePosition()) |position| {
+            _ = objc.CGWarpMouseCursorPosition(.{ .x = position.x, .y = position.y });
+        }
+    }
+    _ = objc.CGAssociateMouseAndMouseCursorPosition(1);
+    app.pointer_detached = false;
 }
 
 fn hideCursor() void {

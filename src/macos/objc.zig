@@ -158,6 +158,12 @@ pub extern "c" fn CGContextSetInterpolationQuality(context: CGContextRef, qualit
 pub extern "c" fn CGContextRelease(context: CGContextRef) void;
 pub extern "c" fn CGPreflightScreenCaptureAccess() bool;
 pub extern "c" fn CGRequestScreenCaptureAccess() bool;
+/// Disassociates the cursor from the pointer, so the mouse keeps reporting motion
+/// while the cursor stays put. That is what a fine cursor is fed from, and it is
+/// what `NSEvent.deltaX`/`deltaY` mean once it is off. The association is per
+/// process and comes back on exit, but every exit path here restores it anyway.
+pub extern "c" fn CGAssociateMouseAndMouseCursorPosition(connected: c_int) c_int;
+pub extern "c" fn CGWarpMouseCursorPosition(position: CGPoint) c_int;
 
 /// `kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little`: the byte
 /// order that matches the core's ARGB8888 pixels on little endian.
@@ -178,3 +184,6 @@ pub const collection_behavior_can_join_all_spaces: NSUInteger = 1 << 0;
 pub const collection_behavior_full_screen_auxiliary: NSUInteger = 1 << 8;
 
 pub const escape_keycode: u16 = 53;
+/// ANSI keycodes for the two gain keys, matching the linux frontend's `-`/`=`.
+pub const minus_keycode: u16 = 27;
+pub const equal_keycode: u16 = 24;

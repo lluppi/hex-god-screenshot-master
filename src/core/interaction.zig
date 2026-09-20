@@ -55,6 +55,11 @@ pub fn hitTest(surfaces: []const Surface, global: Point) ?struct { surface: Surf
     return null;
 }
 
+/// How far inside a surface edge a clamped point is parked. This is small enough
+/// to preserve subpixel positioning while keeping the point inside the
+/// half-open rectangle `localOf` defines.
+const clamp_margin: f64 = 1.0 / 256.0;
+
 /// The colour of a global logical point, from the baseline of the surface under
 /// it.
 pub fn colorAt(surfaces: []const Surface, global: Point) ?color.Rgb {
@@ -136,11 +141,58 @@ const SurfaceState = struct {
     last_badge: ?Rect = null,
 };
 
+/// The overlay's own cursor: a global logical position advanced by raw device
+/// deltas rather than by the compositor's cursor positions.
+///
+/// Those positions are quantised to whole *logical* pixels, and on a
+/// fractional-scaled output a logical pixel is more than one physical pixel, so
+/// no amount of moving the mouse lets the compositor alone address every pixel
+/// of the screen. A delta is not quantised, so this can: the cursor lands where
+/// the arithmetic puts it, and `gain` decides how much of the hand travel it
+/// takes.
+const Fine = struct {
+    position: Point,
+    /// Logical pixels of cursor travel per unit of raw delta.
+    gain: f64,
+};
+
+/// The surface a global logical point lands in, pulling the point into the
+/// nearest surface when it falls outside every one of them. The fine cursor is
+/// not confined to the compositor's own positions, so it can end up over a gap
+/// in a multi-output layout, where there is nothing to sample; `point` is
+/// rewritten to what was actually used.
+fn surfaceAt(surfaces: []const SurfaceState, point: *Point) ?struct { surface: SurfaceId, local: Point } {
+    var nearest: ?struct { surface: SurfaceId, local: Point, distance: f64 } = null;
+    for (surfaces, 0..) |state, index| {
+        const rect = state.config.logical;
+        if (localOf(rect, point.*)) |local| return .{ .surface = index, .local = local };
+
+        const inside = Point{
+            .x = std.math.clamp(point.x, rect.x, @max(rect.x, rect.maxX() - clamp_margin)),
+            .y = std.math.clamp(point.y, rect.y, @max(rect.y, rect.maxY() - clamp_margin)),
+        };
+        const distance = inside.distance(point.*);
+        if (nearest == null or distance < nearest.?.distance) {
+            nearest = .{
+                .surface = index,
+                .local = .{ .x = inside.x - rect.x, .y = inside.y - rect.y },
+                .distance = distance,
+            };
+        }
+    }
+
+    const found = nearest orelse return null;
+    const rect = surfaces[found.surface].config.logical;
+    point.* = .{ .x = rect.x + found.local.x, .y = rect.y + found.local.y };
+    return .{ .surface = found.surface, .local = found.local };
+}
+
 pub const Interaction = struct {
     allocator: std.mem.Allocator,
     surfaces: []SurfaceState,
     coordinator: gesture.Coordinator = .{},
     cursor: ?Cursor = null,
+    fine: ?Fine = null,
     loupe: ?Loupe = null,
     sample: Canvas,
     damages: std.ArrayList(Damage) = .empty,
@@ -201,6 +253,61 @@ pub const Interaction = struct {
             if (cursor.surface == surface) self.cursor = null;
         }
         self.planLoupeRemoval();
+        return self.damages.items;
+    }
+
+    /// Take over the cursor: anchor it at a global logical point and drive it
+    /// from raw deltas at `gain` logical pixels each.
+    pub fn beginFine(self: *Interaction, global: Point, gain: f64) void {
+        var point = global;
+        if (surfaceAt(self.surfaces, &point) == null) return;
+        self.fine = .{ .position = point, .gain = gain };
+    }
+
+    pub fn fineActive(self: *const Interaction) bool {
+        return self.fine != null;
+    }
+
+    /// Where the fine cursor is, so a frontend can park the real pointer under
+    /// it instead of under a position the user has already moved on from.
+    pub fn finePosition(self: *const Interaction) ?Point {
+        return if (self.fine) |fine| fine.position else null;
+    }
+
+    /// Change the fine cursor's speed while it is running.
+    pub fn setFineGain(self: *Interaction, gain: f64) void {
+        if (self.fine) |*fine| fine.gain = gain;
+    }
+
+    /// Advance the fine cursor by raw pointer deltas at its configured gain.
+    /// The returned slice is borrowed until the next mutating call.
+    pub fn advanceFine(self: *Interaction, delta: Point) []const Damage {
+        const fine = self.fine orelse return self.noDamage();
+        return self.advanceFineLogical(.{
+            .x = delta.x * fine.gain,
+            .y = delta.y * fine.gain,
+        });
+    }
+
+    /// Nudge the fine cursor by an exact logical distance, independent of gain.
+    pub fn nudgeFine(self: *Interaction, delta: Point) []const Damage {
+        return self.advanceFineLogical(delta);
+    }
+
+    fn advanceFineLogical(self: *Interaction, delta: Point) []const Damage {
+        const fine = if (self.fine) |*value| value else return self.noDamage();
+        fine.position = .{
+            .x = fine.position.x + delta.x,
+            .y = fine.position.y + delta.y,
+        };
+        var point = fine.position;
+        const hit = surfaceAt(self.surfaces, &point) orelse return self.noDamage();
+        fine.position = point;
+        return self.moveCursor(hit.surface, hit.local);
+    }
+
+    fn noDamage(self: *Interaction) []const Damage {
+        self.damages.clearRetainingCapacity();
         return self.damages.items;
     }
 

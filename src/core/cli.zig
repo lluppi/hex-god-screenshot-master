@@ -9,6 +9,33 @@ const out = @import("out.zig");
 /// out of the source to fill CFBundleShortVersionString.
 pub const version = "0.2.0";
 
+/// Logical pixels of overlay cursor travel per unit of raw pointer delta. At 1
+/// it moves as fast as the compositor's own cursor; below 1 it is deliberately
+/// slower, which buys back the pixels the integer logical grid throws away.
+pub const default_gain: f64 = 0.5;
+
+/// Bounds on `--gain`. Zero means "no fine cursor at all", which is the same as
+/// `--no-fine`; the upper bound is there to stop a typo turning the cursor into
+/// something that crosses the screen in one twitch.
+pub const max_gain: f64 = 20;
+
+/// How much one press of `-` or `=` changes the fine cursor's speed, and how
+/// slow it is allowed to get.
+pub const gain_step: f64 = 1.25;
+pub const gain_min: f64 = 0.02;
+
+const gain_range_error = std.fmt.comptimePrint(
+    "--gain must be between 0 and {d}",
+    .{max_gain},
+);
+
+/// Apply one keyboard gain adjustment without re-enabling an explicitly
+/// disabled fine cursor.
+pub fn adjustedGain(gain: f64, factor: f64) f64 {
+    if (gain == 0) return 0;
+    return std.math.clamp(gain * factor, gain_min, max_gain);
+}
+
 pub const Command = union(enum) {
     /// No option: the overlay. Hover to inspect, click for hex, drag for a shot.
     interactive,
@@ -33,7 +60,7 @@ pub const Dev = union(enum) {
 const dev_hold_default_ms: u64 = 1000;
 
 pub const Parsed = union(enum) {
-    run: struct { command: Command, dev: Dev },
+    run: struct { command: Command, dev: Dev, gain: f64 },
     help,
     version,
     invalid: []const u8,
@@ -46,6 +73,7 @@ pub fn parse(args: []const []const u8) Parsed {
     var drag: ?geom.FRect = null;
     var via: ?geom.Point = null;
     var hold_ms: u64 = dev_hold_default_ms;
+    var gain: f64 = default_gain;
 
     var rest = Cursor{ .items = args };
     while (rest.next()) |arg| {
@@ -57,6 +85,14 @@ pub fn parse(args: []const []const u8) Parsed {
             command = .{ .shot = parseRect(value) orelse return .{ .invalid = "--shot needs X,Y,W,H" } };
         } else if (std.mem.eql(u8, arg, "--info")) {
             command = .info;
+        } else if (std.mem.eql(u8, arg, "--gain")) {
+            const value = rest.next() orelse return .{ .invalid = "--gain needs a number" };
+            gain = std.fmt.parseFloat(f64, value) catch return .{ .invalid = "--gain needs a number" };
+            if (!std.math.isFinite(gain) or gain < 0 or gain > max_gain) {
+                return .{ .invalid = gain_range_error };
+            }
+        } else if (std.mem.eql(u8, arg, "--no-fine")) {
+            gain = 0;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return .help;
         } else if (std.mem.eql(u8, arg, "--version")) {
@@ -89,7 +125,7 @@ pub fn parse(args: []const []const u8) Parsed {
         .{ .click = point }
     else
         .none;
-    return .{ .run = .{ .command = command, .dev = dev } };
+    return .{ .run = .{ .command = command, .dev = dev, .gain = gain } };
 }
 
 /// Step through the argument list, so a flag can take the value that follows it.
@@ -130,15 +166,26 @@ pub fn printVersion() void {
 }
 
 pub fn printUsage() void {
+    // Two prints on purpose: one line comes out of a fixed 1024 byte buffer, and
+    // the whole list no longer fits in one of them.
     out.print(
         \\usage: hgsm [option]
         \\
         \\  (no option)          overlay: hover to inspect, click for hex, drag for a screenshot
         \\  --pick X,Y           print and copy the hex of a pixel, in logical coordinates
         \\  --shot X,Y,W,H       copy a logical rectangle as a PNG screenshot
-        \\  --info               print the displays and their scales
+        \\  --gain N             overlay cursor speed, in logical pixels per raw pointer
+        \\                       delta (default 0.5). 1 matches the compositor's own
+        \\                       cursor, lower is finer, and 0 is --no-fine
+        \\  --no-fine            drive the overlay cursor from the compositor's cursor
+        \\                       positions, like a compositor without relative-pointer
+        \\  --info               print the displays, their scales and the fine pointer
+        \\                       protocols on offer
         \\  --version            print the version
         \\  --help, -h           print this
+        \\
+    , .{});
+    out.print(
         \\
         \\ Development (linux): drive a synthetic gesture through the real handlers,
         \\ so the click and drag paths can be exercised from a script.
