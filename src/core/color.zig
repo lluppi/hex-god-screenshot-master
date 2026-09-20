@@ -86,27 +86,31 @@ fn fromLinear(value: f32) u32 {
 }
 
 /// `over`, but the colour mix happens in linear light instead of in sRGB codes.
-/// Only the anti-aliased edges of the loupe go through this: it is where the
-/// gamma error is visible, and it costs three table lookups and a search.
+/// Only anti-aliased glyph edges go through this: light text on a dark plate is
+/// where the gamma error is visible, and it costs table lookups and a search.
 pub fn overLinear(dst: u32, src: u32) u32 {
     const sa: u32 = (src >> 24) & 0xff;
     if (sa == 0) return dst;
     if (sa == 255) return src;
+    const da: u32 = (dst >> 24) & 0xff;
 
-    const alpha: f32 = @as(f32, @floatFromInt(sa)) / 255.0;
-    const keep = 1 - alpha;
+    const s_alpha: f32 = @as(f32, @floatFromInt(sa)) / 255.0;
+    const d_alpha: f32 = @as(f32, @floatFromInt(da)) / 255.0;
+    const d_keep = d_alpha * (1 - s_alpha);
+    const r_alpha = s_alpha + d_keep;
 
-    // Un-premultiply so the source's own colour is decoded, not its faded form.
+    // Un-premultiply both sides so their own colours are decoded, mix in
+    // linear light, then re-premultiply by the result alpha.
     var out: u32 = 0;
     inline for (.{ 16, 8, 0 }) |shift| {
         const s: u32 = @min(255, (((src >> shift) & 0xff) * 255 + sa / 2) / sa);
-        const d: u32 = (dst >> shift) & 0xff;
-        const mixed = to_linear[s] * alpha + to_linear[d] * keep;
-        out |= fromLinear(mixed) << shift;
+        const d: u32 = if (da == 0) 0 else @min(255, (((dst >> shift) & 0xff) * 255 + da / 2) / da);
+        const mixed = (to_linear[s] * s_alpha + to_linear[d] * d_keep) / r_alpha;
+        const encoded: f32 = @floatFromInt(fromLinear(mixed));
+        out |= @as(u32, @intFromFloat(@round(encoded * r_alpha))) << shift;
     }
 
-    const da: u32 = (dst >> 24) & 0xff;
-    const a: u32 = @min(sa + (da * (255 - sa) + 128) / 255, 255);
+    const a: u32 = @intFromFloat(@round(r_alpha * 255));
     return (a << 24) | out;
 }
 

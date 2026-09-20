@@ -1,100 +1,115 @@
 //! Bitmap text for the loupe badge and the dimension badge.
 //!
-//! The glyph masks in `font_data.zig` are baked by `scripts/gen-font.py` at
-//! `supersample` times the cell size they are drawn at. Drawing box filters the
-//! mask down to the requested size, so every stroke gets a proportional
-//! anti-aliased edge. Scaling a 1x ink mask with nearest neighbour - what this
-//! did before - gives each stroke a different width whenever the scale is not a
-//! whole number, which is what made the text look jagged.
+//! The glyph masks in `font_data.bin` are baked by `scripts/gen-font.py` at
+//! `supersample` times the cell size they are drawn at, one byte of area
+//! coverage per sample. Drawing resamples that mask onto the destination grid:
+//! each destination pixel maps to a rectangle of the mask and takes the exact
+//! area-weighted mean of the samples it covers, or a bilinear read when the
+//! rectangle is smaller than one sample. Glyphs advance by a fractional pen so
+//! spacing stays even at any scale, and edge pixels are blended in linear light
+//! so the ramps read as ramps rather than beading.
 
-const std = @import("std");
 const data = @import("font_data.zig");
 const canvas_mod = @import("canvas.zig");
-const color = @import("color.zig");
 
 const Canvas = canvas_mod.Canvas;
 
-/// Advance width of one glyph cell at the given scale, in pixels.
-pub fn advance(scale: f64) i32 {
-    return @max(1, @as(i32, @intFromFloat(@round(@as(f64, @floatFromInt(data.cell_width)) * scale))));
+const mask_w: f64 = @floatFromInt(data.mask_width);
+const mask_h: f64 = @floatFromInt(data.mask_height);
+
+/// Advance width of one glyph cell at the given scale, in pixels. Fractional
+/// on purpose: rounding it would drift the text off-centre at odd scales.
+pub fn advance(scale: f64) f64 {
+    return @as(f64, @floatFromInt(data.cell_width)) * scale;
 }
 
 pub fn cellHeight(scale: f64) i32 {
-    return @max(
-        1,
-        @as(i32, @intFromFloat(@round(@as(f64, @floatFromInt(data.cell_height)) * scale))),
-    );
+    return @max(1, @as(i32, @intFromFloat(@round(@as(f64, @floatFromInt(data.cell_height)) * scale))));
 }
 
 pub fn textWidth(text: []const u8, scale: f64) i32 {
-    return advance(scale) * @as(i32, @intCast(text.len));
+    return @intFromFloat(@ceil(advance(scale) * @as(f64, @floatFromInt(text.len))));
 }
 
 /// Draw `text` with its top-left corner at (x, y). Unknown characters render as
 /// blanks, which keeps the badges from ever looking broken.
-pub fn draw(
-    canvas: *Canvas,
-    x: i32,
-    y: i32,
-    text: []const u8,
-    scale: f64,
-    pixel: u32,
-) void {
+pub fn draw(canvas: *Canvas, x: i32, y: i32, text: []const u8, scale: f64, pixel: u32) void {
     const cell_w = advance(scale);
-    const cell_h = cellHeight(scale);
-    var pen = x;
+    const cell_h = @as(f64, @floatFromInt(data.cell_height)) * scale;
+    const top: f64 = @floatFromInt(y);
+    const first_row = y;
+    const last_row: i32 = @intFromFloat(@ceil(top + cell_h));
+
+    var pen: f64 = @floatFromInt(x);
     for (text) |char| {
-        if (data.find(char)) |glyph| {
-            var dy: i32 = 0;
-            while (dy < cell_h) : (dy += 1) {
-                var dx: i32 = 0;
-                while (dx < cell_w) : (dx += 1) {
-                    const ink = coverage(glyph, dx, dy, cell_w, cell_h);
-                    if (ink <= 0) continue;
-                    canvas.blendCoverage(pen + dx, y + dy, pixel, ink);
-                }
+        defer pen += cell_w;
+        const glyph = data.find(char) orelse continue;
+        const first_col: i32 = @intFromFloat(@floor(pen));
+        const last_col: i32 = @intFromFloat(@ceil(pen + cell_w));
+
+        var row = first_row;
+        while (row < last_row) : (row += 1) {
+            const py: f64 = @floatFromInt(row);
+            const t = (py - top) * mask_h / cell_h;
+            const b = (py + 1 - top) * mask_h / cell_h;
+            var col = first_col;
+            while (col < last_col) : (col += 1) {
+                const px: f64 = @floatFromInt(col);
+                const l = (px - pen) * mask_w / cell_w;
+                const r = (px + 1 - pen) * mask_w / cell_w;
+                const ink = coverage(glyph, l, r, t, b);
+                if (ink <= 0) continue;
+                canvas.blendCoverageLinear(col, row, pixel, ink);
             }
         }
-        pen += cell_w;
     }
 }
 
-/// How much of the destination pixel at (dx, dy) inside a `cell_w` x `cell_h`
-/// cell is covered by ink, box filtering the supersampled mask: the mask
-/// rectangle the pixel maps onto is summed, each sample weighted by how much of
-/// it actually overlaps.
-fn coverage(glyph: *const data.Glyph, dx: i32, dy: i32, cell_w: i32, cell_h: i32) f64 {
-    const mask_w: f64 = @floatFromInt(data.mask_width);
-    const mask_h: f64 = @floatFromInt(data.mask_height);
-    const width: f64 = @floatFromInt(cell_w);
-    const height: f64 = @floatFromInt(cell_h);
-
-    const left = @as(f64, @floatFromInt(dx)) * mask_w / width;
-    const right = @as(f64, @floatFromInt(dx + 1)) * mask_w / width;
-    const top = @as(f64, @floatFromInt(dy)) * mask_h / height;
-    const bottom = @as(f64, @floatFromInt(dy + 1)) * mask_h / height;
+/// Mean coverage of the mask over the rectangle [l, r) x [t, b) in mask
+/// sample units. Area-weighted when the rectangle spans at least one sample on
+/// both axes, bilinear at its centre otherwise, so magnified text keeps smooth
+/// ramps instead of stepping sample by sample.
+fn coverage(glyph: *const [data.glyph_bytes]u8, l: f64, r: f64, t: f64, b: f64) f64 {
+    if (r - l < 1 or b - t < 1) return bilinear(glyph, (l + r) / 2, (t + b) / 2);
 
     var ink: f64 = 0;
-    var sample_y: i32 = @intFromFloat(@floor(top));
-    const last_y: i32 = @intFromFloat(@ceil(bottom));
-    while (sample_y < last_y) : (sample_y += 1) {
-        if (sample_y < 0 or sample_y >= data.mask_height) continue;
-        const span_y = @min(bottom, @as(f64, @floatFromInt(sample_y + 1))) -
-            @max(top, @as(f64, @floatFromInt(sample_y)));
+    var sy: i32 = @intFromFloat(@floor(t));
+    const end_y: i32 = @intFromFloat(@ceil(b));
+    while (sy < end_y) : (sy += 1) {
+        if (sy < 0 or sy >= data.mask_height) continue;
+        const fy: f64 = @floatFromInt(sy);
+        const span_y = @min(b, fy + 1) - @max(t, fy);
         if (span_y <= 0) continue;
+        const row = glyph[@as(usize, @intCast(sy)) * data.mask_width ..][0..data.mask_width];
 
-        const row = glyph.rows[@intCast(sample_y)];
-        var sample_x: i32 = @intFromFloat(@floor(left));
-        const last_x: i32 = @intFromFloat(@ceil(right));
-        while (sample_x < last_x) : (sample_x += 1) {
-            if (sample_x < 0 or sample_x >= data.mask_width) continue;
-            const span_x = @min(right, @as(f64, @floatFromInt(sample_x + 1))) -
-                @max(left, @as(f64, @floatFromInt(sample_x)));
+        var sx: i32 = @intFromFloat(@floor(l));
+        const end_x: i32 = @intFromFloat(@ceil(r));
+        while (sx < end_x) : (sx += 1) {
+            if (sx < 0 or sx >= data.mask_width) continue;
+            const fx: f64 = @floatFromInt(sx);
+            const span_x = @min(r, fx + 1) - @max(l, fx);
             if (span_x <= 0) continue;
-            const shift: u5 = @intCast(@as(i64, data.mask_width) - 1 - sample_x);
-            if (row >> shift & 1 != 0) ink += span_x * span_y;
+            ink += span_x * span_y * @as(f64, @floatFromInt(row[@intCast(sx)]));
         }
     }
+    return ink / (255.0 * (r - l) * (b - t));
+}
 
-    return ink / ((right - left) * (bottom - top));
+/// Bilinear coverage at a mask position, samples centred on half-integers and
+/// zero outside the mask.
+fn bilinear(glyph: *const [data.glyph_bytes]u8, x: f64, y: f64) f64 {
+    const gx = x - 0.5;
+    const gy = y - 0.5;
+    const x0: i32 = @intFromFloat(@floor(gx));
+    const y0: i32 = @intFromFloat(@floor(gy));
+    const fx = gx - @as(f64, @floatFromInt(x0));
+    const fy = gy - @as(f64, @floatFromInt(y0));
+    const top = sample(glyph, x0, y0) * (1 - fx) + sample(glyph, x0 + 1, y0) * fx;
+    const bottom = sample(glyph, x0, y0 + 1) * (1 - fx) + sample(glyph, x0 + 1, y0 + 1) * fx;
+    return (top * (1 - fy) + bottom * fy) / 255.0;
+}
+
+fn sample(glyph: *const [data.glyph_bytes]u8, x: i32, y: i32) f64 {
+    if (x < 0 or y < 0 or x >= data.mask_width or y >= data.mask_height) return 0;
+    return @floatFromInt(glyph[@as(usize, @intCast(y)) * data.mask_width + @as(usize, @intCast(x))]);
 }
