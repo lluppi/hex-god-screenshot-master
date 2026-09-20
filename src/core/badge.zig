@@ -1,4 +1,4 @@
-//! Shared geometry and painting for dark rounded text badges.
+//! Shared geometry and painting for compact instrument readouts.
 
 const canvas_mod = @import("canvas.zig");
 const color = @import("color.zig");
@@ -27,14 +27,19 @@ pub fn metrics(text: []const u8, ui_scale: f64) Metrics {
 }
 
 pub fn draw(canvas: *Canvas, rect: Rect, text: []const u8, ui_scale: f64) void {
-    const layout = metrics(text, ui_scale);
-    canvas.fillRoundedRect(rect, 5 * ui_scale, color.black(209));
+    drawPlate(canvas, rect, text, ui_scale);
+}
+
+fn drawPlate(canvas: *Canvas, rect: Rect, text: []const u8, ui_scale: f64) void {
+    const text_width = font.textWidth(text, ui_scale);
+    const text_height = font.cellHeight(ui_scale);
+    canvas.blendRect(rect, color.black(226));
     font.draw(
         canvas,
-        rect.x + layout.padding_x,
-        rect.y + layout.padding_y,
+        rect.x + @divTrunc(rect.w - text_width, 2),
+        rect.y + @divTrunc(rect.h - text_height, 2),
         text,
         ui_scale,
-        color.solid(.{ .r = 255, .g = 255, .b = 255 }),
+        color.solid(.{ .r = 0xee, .g = 0xec, .b = 0xed }),
     );
 }

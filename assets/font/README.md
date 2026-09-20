@@ -15,5 +15,6 @@ Regenerate from the original 1214×761 image with Pillow, Bun and trace-god:
 python3 tools/extract-font.py ~/Downloads/glyphs.png ../trace-god assets/font
 ```
 
-These are assets only; the app's baked font is unchanged. Source font licensing
-is unknown: confirm permission before distributing derived glyphs.
+These SVGs are the app font's source: `tools/gen-font.py` rasterises them into
+`src/core/font_data.zig`. Re-run both when the glyphs change. Source font
+licensing is unknown: confirm permission before distributing derived glyphs.

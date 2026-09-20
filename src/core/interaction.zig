@@ -97,6 +97,7 @@ pub const Interaction = struct {
         self.cursor = .{ .surface = surface, .local = local, .global = global };
 
         if (self.coordinator.isSelecting()) {
+            sampling.fillSample(&self.sample, config.baseline, config.scale, local);
             const previous = self.coordinator.selection;
             _ = self.coordinator.move(global);
             self.planSelectionDamage(previous, self.coordinator.selection);
@@ -156,6 +157,7 @@ pub const Interaction = struct {
             .baseline = config.baseline,
             .selection = self.selectionPhysical(surface, self.coordinator.selection),
             .cursor = self.cursorPhysical(surface),
+            .endpoint_sample = if (self.coordinator.isSelecting()) self.sample else null,
             .ui_scale = config.scale,
         }, region);
 
@@ -225,8 +227,9 @@ pub const Interaction = struct {
             if (self.selectionPhysical(index, next)) |selection| {
                 if (self.cursorPhysical(index)) |cursor| {
                     if (overlay.sizeBadge(selection, cursor, surface.config.scale, surface.config.baseline.rect())) |badge| {
-                        damage = damage.unionWith(badge.rect.expand(2));
-                        surface.last_badge = badge.rect;
+                        const bounds = badge.bounds();
+                        damage = damage.unionWith(bounds.expand(2));
+                        surface.last_badge = bounds;
                     }
                 }
             }

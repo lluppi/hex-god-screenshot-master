@@ -139,6 +139,8 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                 app.interaction.?.deinit();
                 app.interaction = null;
             }
+            hideCursor();
+            defer showCursor();
             current_app = &app;
             objc.msgSend(void, application, objc.sel("activateIgnoringOtherApps:"), .{true});
             updateHoverFromMouse(&app);
@@ -691,7 +693,7 @@ fn viewAcceptsFirstMouse(self: id, cmd: SEL, event: id) callconv(.c) bool {
 fn viewResetCursorRects(self: id, cmd: SEL) callconv(.c) void {
     _ = self;
     _ = cmd;
-    // The crosshair is applied on every mouse move instead.
+    // The native cursor stays hidden while the overlay owns the pointer.
 }
 
 fn windowCanBecomeKey(self: id, cmd: SEL) callconv(.c) bool {
@@ -718,7 +720,6 @@ fn viewMouseMoved(self: id, cmd: SEL, event: id) callconv(.c) void {
     _ = cmd;
     const app = current_app orelse return;
     const display = displayForView(self) orelse return;
-    setCrosshairCursor();
     updateCursor(app, display, viewPoint(self, display, event));
 }
 
@@ -763,7 +764,10 @@ fn viewKeyDown(self: id, cmd: SEL, event: id) callconv(.c) void {
     if (keycode == objc.escape_keycode) cancel(app);
 }
 
-fn setCrosshairCursor() void {
-    const cursor = objc.msgSend(id, objc.class("NSCursor"), objc.sel("crosshairCursor"), .{});
-    if (cursor != null) objc.msgSend(void, cursor, objc.sel("set"), .{});
+fn hideCursor() void {
+    objc.msgSend(void, objc.class("NSCursor"), objc.sel("hide"), .{});
+}
+
+fn showCursor() void {
+    objc.msgSend(void, objc.class("NSCursor"), objc.sel("unhide"), .{});
 }

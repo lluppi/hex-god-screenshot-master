@@ -181,12 +181,10 @@ pub const App = struct {
     clip_last_send_ms: ?i64 = null,
     clip_cancelled: bool = false,
 
-    // Keyboard/cursor.
+    // Keyboard.
     xkb_context: ?*anyopaque = null,
     xkb_keymap: ?*anyopaque = null,
     xkb_state: ?*anyopaque = null,
-    cursor_surface: ?*wl.Obj = null,
-    cursor_buffer: ?*shm_mod.ShmBuffer = null,
 
     overlays_up: bool = false,
     /// True while a synthetic gesture from --dev-click/--dev-drag is running.
@@ -421,8 +419,6 @@ fn startOverlay(self: *App) !void {
         self.interaction.?.deinit();
         self.interaction = null;
     }
-    try createCursor(self);
-
     for (self.outputs.items) |o| {
         const surface = wl.compositorCreateSurface(self.compositor.?, self.compositor_version) orelse
             return error.CreateSurfaceFailed;
@@ -506,14 +502,6 @@ fn teardownOverlay(self: *App) void {
         o.have_buffers = false;
         o.fresh = .{ true, true };
         for (&o.dirty) |*dirty| dirty.clearRetainingCapacity();
-    }
-    if (self.cursor_surface) |surface| {
-        wl.surfaceDestroy(surface);
-        self.cursor_surface = null;
-    }
-    if (self.cursor_buffer) |buffer| {
-        buffer.destroy();
-        self.cursor_buffer = null;
     }
     if (self.interaction) |*interaction| {
         interaction.deinit();
@@ -936,44 +924,10 @@ fn eventLoop(self: *App) !void {
 // Cursor theme: a hand drawn crosshair, since we cannot rely on a cursor theme
 // ---------------------------------------------------------------------------
 
-fn createCursor(self: *App) !void {
-    const size: u32 = 33;
-    const surface = wl.compositorCreateSurface(self.compositor.?, self.compositor_version) orelse
-        return error.CreateSurfaceFailed;
-    self.cursor_surface = surface;
-
-    const buffer = try self.allocator.create(shm_mod.ShmBuffer);
-    buffer.* = .{};
-    try buffer.create(
-        self.shm.?,
-        self.shm_version,
-        size,
-        size,
-        wl.shm_format_argb8888,
-        size * 4,
-    );
-    const canvas = buffer.canvas();
-    const ink = color_mod.solid(.{ .r = 255, .g = 255, .b = 255 });
-    const outline = color_mod.black(255);
-    const centre: i32 = @intCast(size / 2);
-    const arm: i32 = 7;
-    // Heavy black outline first, then a white cross on top.
-    canvas.fillRect(.{ .x = centre - 1, .y = centre - arm, .w = 3, .h = arm * 2 + 1 }, outline);
-    canvas.fillRect(.{ .x = centre - arm, .y = centre - 1, .w = arm * 2 + 1, .h = 3 }, outline);
-    canvas.fillRect(.{ .x = centre, .y = centre - arm, .w = 1, .h = arm * 2 + 1 }, ink);
-    canvas.fillRect(.{ .x = centre - arm, .y = centre, .w = arm * 2 + 1, .h = 1 }, ink);
-    canvas.fillRect(.{ .x = centre, .y = centre, .w = 1, .h = 1 }, outline);
-
-    wl.surfaceAttach(surface, buffer.buffer.?, 0, 0);
-    wl.surfaceCommit(surface);
-    self.cursor_buffer = buffer;
-}
-
-fn applyCursor(self: *App) void {
-    const surface = self.cursor_surface orelse return;
+fn hideCursor(self: *App) void {
     const pointer = self.pointer orelse return;
     if (self.pointer_version < 1) return;
-    wl.pointerSetCursor(pointer, self.pointer_serial, surface, 16, 16);
+    wl.pointerSetCursor(pointer, self.pointer_serial, null, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,7 +1166,7 @@ fn onPointerEnter(
     if (app.dev_gesture_active) return;
     app.pointer_serial = serial;
     app.last_serial = serial;
-    applyCursor(app);
+    hideCursor(app);
     const o = outputForSurface(app, surface) orelse return;
     updateCursor(app, o, .{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) });
 }

@@ -64,17 +64,23 @@ pub fn main(init: std.process.Init) !void {
     const selection = geom.Rect{ .x = 300, .y = 240, .w = 260, .h = 180 };
     const cursor = geom.Point{ .x = 560, .y = 420 };
 
+    var sample = try canvas_mod.Canvas.init(allocator, magnifier.sample_side, magnifier.sample_side);
+    defer sample.deinit();
+    sampling.fillSample(&sample, &baseline, 1, cursor);
+
     overlay.renderRegion(&frame, .{
         .baseline = &baseline,
         .selection = selection,
         .cursor = cursor,
+        .endpoint_sample = sample,
         .ui_scale = ui_scale,
     }, frame.rect());
 
-    var sample = try canvas_mod.Canvas.init(allocator, magnifier.sample_side, magnifier.sample_side);
-    defer sample.deinit();
-    sampling.fillSample(&sample, &baseline, 1, cursor);
-    overlay.renderMagnifier(&frame, magnifier.windowOrigin(cursor, ui_scale), sample, ui_scale);
+    const hover_cursor = geom.Point{ .x = 730, .y = 150 };
+    var hover_sample = try canvas_mod.Canvas.init(allocator, magnifier.sample_side, magnifier.sample_side);
+    defer hover_sample.deinit();
+    sampling.fillSample(&hover_sample, &baseline, 1, hover_cursor);
+    overlay.renderMagnifier(&frame, magnifier.windowOrigin(hover_cursor, ui_scale), hover_sample, ui_scale);
 
     const bytes = try png.encode(allocator, frame);
     defer allocator.free(bytes);

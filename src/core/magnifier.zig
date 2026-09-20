@@ -1,17 +1,10 @@
-//! The circular loupe and its live hex badge. A port of the original AppKit
-//! `MagnifierView`, except that the drawing is done by hand so the identical
-//! pixels come out on Wayland and on macOS.
+//! The live pixel scope and its hex readout. The scope is deliberately a hard,
+//! square instrument: the sampled pixels are the interface, not decoration.
 //!
-//! All measurements are the original AppKit point values multiplied by
-//! `ui_scale`, the physical pixels per logical pixel of the output being drawn
-//! on, so the loupe looks the same size on a 1x and a 1.25x display. The sample
-//! itself is always 21 *physical* pixels, which is what makes the centre of the
-//! loupe the exact pixel under the cursor.
-//!
-//! Coordinates here are y-down (screen convention), so this is the Swift view
-//! flipped.
+//! Measurements are points multiplied by `ui_scale`, so the instrument keeps
+//! the same apparent size on every display. The source sample always remains
+//! physical pixels and is enlarged with nearest-neighbour sampling.
 
-const std = @import("std");
 const badge = @import("badge.zig");
 const canvas_mod = @import("canvas.zig");
 const color = @import("color.zig");
@@ -20,61 +13,20 @@ const geom = @import("geom.zig");
 const Canvas = canvas_mod.Canvas;
 const Rect = geom.Rect;
 
-/// Half-width, in device pixels, of the tent-shaped reconstruction filter that
-/// every circular edge is drawn through.
-///
-/// Exact pixel-area coverage (a box filter) is what a ~1px curve looks ropey
-/// under: where the stroke lands on one pixel column it renders at full white,
-/// where it straddles two it renders as a pair at ~60%, and on the diagonal it
-/// becomes a chain of single bright pixels. The total ink per unit of arc is
-/// constant, but the *peak* jumps with the sub-pixel phase, and that beading is
-/// what reads as jaggedness. Text and 2D renderers low-pass the coverage
-/// with a filter wider than a pixel for exactly this reason (FreeType's LCD FIR
-/// filter, Skia's two-pixel hairline ramps, the >1px kernels of film
-/// renderers). A tent of this radius trades a little crispness for a stroke
-/// whose brightness barely changes as it sweeps through the pixel grid.
-const filter_radius: f64 = 1.0;
+pub const scope_size: f64 = 180;
+pub const endpoint_scope_size: f64 = 30;
+pub const endpoint_sample_side: u32 = 3;
+const plate_height: f64 = 28;
+pub const window_width: f64 = scope_size;
+pub const window_height: f64 = scope_size + plate_height;
+/// Distance from the window's top-left corner to the cursor: the centre cell.
+pub const cursor_inset: f64 = scope_size / 2;
 
-/// Fraction of the pixel filter that lies on the inside of a straight edge
-/// passing `inside` pixels from the pixel centre (positive when the centre
-/// itself is inside). This is the tent kernel's integral, so it is C1: no
-/// kink where the ramp meets full or zero coverage.
-fn edgeWeight(inside: f64) f64 {
-    if (inside <= -filter_radius) return 0;
-    if (inside >= filter_radius) return 1;
-    const t = (inside + filter_radius) / (2 * filter_radius);
-    return if (t < 0.5) 2 * t * t else 1 - 2 * (1 - t) * (1 - t);
-}
-
-/// Filtered coverage of the disc of `radius` for a pixel whose centre is `dist`
-/// from the disc centre. The circle is treated as a straight edge across the
-/// filter's support: with radii of 90px and up the arc sags less than 0.01px
-/// over that span, far below one level of the 8-bit output.
-fn discWeight(radius: f64, dist: f64) f64 {
-    return edgeWeight(radius - dist);
-}
-
-/// Gap between the circle and the window edge on the left, right and top.
-const margin: f64 = 3;
-/// How far the window extends below the circle, where the hex badge sits.
-const below_circle: f64 = 32;
-
-pub const circle_diameter: f64 = 180;
-pub const window_width: f64 = circle_diameter + 2 * margin;
-pub const window_height: f64 = circle_diameter + margin + below_circle;
-/// Distance from the window's top-left corner to the cursor: the loupe centre.
-pub const cursor_inset: f64 = circle_diameter / 2 + margin;
-
-/// Physical pixels sampled around the cursor. The circle is `circle_diameter`
-/// wide, so a 13x13 sample gives roughly 14 loupe pixels per screen pixel at 1x.
-/// Kept odd so the sample has a true centre pixel: that is the colour copied.
+/// Physical pixels sampled around the cursor. Kept odd so there is one exact
+/// centre pixel: that is both the target and the colour copied on click.
 pub const sample_side: u32 = 13;
 
-pub fn ringRadius(ui_scale: f64) f64 {
-    return circle_diameter * ui_scale / 2.0;
-}
-
-/// Top-left corner of the magnifier window for a cursor at `point`.
+/// Top-left corner of the scope window for a cursor at `point`.
 pub fn windowOrigin(cursor: geom.Point, ui_scale: f64) geom.Point {
     return .{
         .x = cursor.x - cursor_inset * ui_scale,
@@ -100,190 +52,235 @@ pub fn windowRect(origin: geom.Point, ui_scale: f64) Rect {
     };
 }
 
-/// Everything inside the disc for one pixel: the magnified sample, the cell
-/// grid and the ring, stacked.
-const Disc = struct {
-    sample: Canvas,
-    /// Canvas coordinates of the disc's bounding square.
-    left: i32,
-    top: i32,
-    diameter: i32,
-    /// Grid line positions, in pixels from the bounding square's edge.
-    grid: [sample_side]i32,
-    centre_x: f64,
-    centre_y: f64,
-    radius: f64,
-    ring: f64,
-    separator: f64,
+/// First destination pixel at or beyond a sample-cell boundary.
+fn gridOffset(step: u32, size: i32) i32 {
+    const scaled = @as(u64, step) * @as(u64, @intCast(size));
+    return @intCast((scaled + sample_side - 1) / sample_side);
+}
 
-    const body_colour = color.solid(.{ .r = 0x1e, .g = 0x1e, .b = 0x1e });
-    const grid_ink = color.black(40);
-    const ring_ink = color.solid(.{ .r = 255, .g = 255, .b = 255 });
+fn endpointGridOffset(step: u32, size: i32) i32 {
+    const scaled = @as(u64, step) * @as(u64, @intCast(size));
+    return @intCast((scaled + endpoint_sample_side - 1) / endpoint_sample_side);
+}
 
-    /// The composited colour for a pixel `dx`, `dy` from the square's top left,
-    /// whose centre is `dist` from the disc centre and whose filtered disc
-    /// coverage is `outer` (> 0).
-    fn pixelAt(self: Disc, dx: i32, dy: i32, dist: f64, outer: f64) u32 {
-        var pixel = body_colour;
-        if (self.sample.width > 0 and self.sample.height > 0) {
-            if (dx >= 0 and dy >= 0 and dx < self.diameter and dy < self.diameter) {
-                const sx: u32 = @intCast(@as(u64, @intCast(dx)) * self.sample.width / @as(u64, @intCast(self.diameter)));
-                const sy: u32 = @intCast(@as(u64, @intCast(dy)) * self.sample.height / @as(u64, @intCast(self.diameter)));
-                if (self.sample.get(@intCast(@min(sx, self.sample.width - 1)), @intCast(@min(sy, self.sample.height - 1)))) |sampled| {
-                    pixel = sampled;
-                }
-            }
-        }
+fn targetInk(rgb: color.Rgb) u32 {
+    const perceived_light = @as(u32, rgb.r) * 299 + @as(u32, rgb.g) * 587 + @as(u32, rgb.b) * 114;
+    return if (perceived_light >= 128_000)
+        color.solid(.{ .r = 0x00, .g = 0x00, .b = 0x00 })
+    else
+        color.solid(.{ .r = 0xff, .g = 0xff, .b = 0xff });
+}
 
-        for (self.grid) |offset| {
-            if (offset == 0) continue;
-            if (dx == offset or dy == offset) pixel = color.overLinear(pixel, grid_ink);
-        }
+fn blendFrame(canvas: *Canvas, rect: Rect, thickness: i32, pixel: u32) void {
+    blendFrameEdges(canvas, rect, thickness, pixel, true, true, true, true);
+}
 
-        return self.withRing(pixel, dist, outer);
-    }
+fn blendFrameEdges(
+    canvas: *Canvas,
+    rect: Rect,
+    thickness: i32,
+    pixel: u32,
+    top: bool,
+    bottom: bool,
+    left: bool,
+    right: bool,
+) void {
+    if (top) canvas.blendRect(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = thickness }, pixel);
+    if (bottom) canvas.blendRect(.{ .x = rect.x, .y = rect.maxY() - thickness, .w = rect.w, .h = thickness }, pixel);
+    if (left) canvas.blendRect(.{ .x = rect.x, .y = rect.y, .w = thickness, .h = rect.h }, pixel);
+    if (right) canvas.blendRect(.{ .x = rect.maxX() - thickness, .y = rect.y, .w = thickness, .h = rect.h }, pixel);
+}
 
-    /// The ring is part of the same stack as everything else, so the silhouette
-    /// is anti-aliased exactly once (see `render`). Only the ring's *inner*
-    /// boundaries are softened here; its outer boundary is the disc's edge and
-    /// belongs to the single coverage multiply at the end.
-    fn withRing(self: Disc, base: u32, dist: f64, outer: f64) u32 {
-        const ring_inner = self.radius - self.ring;
-        const separator_inner = ring_inner - self.separator;
-        // Everything inside the separator's inner edge, less the filter's
-        // reach, is plain magnified content: the common case, so leave early.
-        if (dist < separator_inner - filter_radius) return base;
-
-        // The three bands are nested discs, so each band's weight is the
-        // difference of two disc weights, all through the same filter.
-        const white_inner = discWeight(ring_inner, dist);
-        const separator_inner_weight = discWeight(separator_inner, dist);
-
-        // Coverage is conditional on being inside the disc. The outer coverage
-        // is applied once in `render`; conditioning here avoids multiplying the
-        // same edge coverage twice where a thin ring meets the silhouette.
-        const white = std.math.clamp((outer - white_inner) / outer, 0, 1);
-        const separator = std.math.clamp((white_inner - separator_inner_weight) / outer, 0, 1);
-
-        var pixel = base;
-        // The bands are disjoint. Account for the white band's later src-over
-        // coverage so the separator retains exactly its filtered weight instead
-        // of being faded a second time beneath the white.
-        if (separator > 0 and white < 1) {
-            const separator_before_white = @min(1, separator / (1 - white));
-            pixel = color.overLinear(pixel, color.withCoverage(grid_ink, separator_before_white));
-        }
-        if (white > 0) pixel = color.overLinear(pixel, color.withCoverage(ring_ink, white));
-        return pixel;
-    }
-};
-
-/// Draw the whole loupe: disc, ring, badge.
-///
-/// The disc is composited in a single pass, because the edge has to be
-/// anti-aliased *after* every layer is stacked: filling the body anti-aliased
-/// and then stamping the sample over it with a hard circular clip undoes the
-/// edge, which is what left the circle looking rough. Grid lines are part of the
-/// same pass and are clipped by the disc's coverage, so they cannot bleed into
-/// the corners of the bounding square.
-///
-/// The ring is in that pass too. Stroking it as a separate anti-aliased circle
-/// applied a second coverage ramp on top of the disc's, so the silhouette came
-/// out as `2c - c^2` instead of `c`: a half-covered edge pixel was drawn at 75%
-/// and the whole ramp collapsed into roughly one hard pixel. One stack, one
-/// coverage multiply, one edge.
+/// Draw the scope, target cell and attached colour plate.
 pub fn render(canvas: *Canvas, origin: geom.Point, sample: Canvas, ui_scale: f64) void {
     const window = windowRect(origin, ui_scale);
     if (!window.intersects(canvas.rect())) return;
 
-    const radius = ringRadius(ui_scale);
-    const inset: i32 = @intFromFloat(@round(cursor_inset * ui_scale));
-    const diameter: i32 = @intFromFloat(@round(circle_diameter * ui_scale));
-    const left = window.x + inset - @divTrunc(diameter, 2);
-    const top = window.y + inset - @divTrunc(diameter, 2);
-    // The centre sits at the centre of the cursor's pixel, not on its top-left
-    // corner. Half a pixel sounds like nothing, but with an integer radius a
-    // corner-centred circle puts all four of its extremes exactly on a pixel
-    // boundary: the left and right flanks then have *no* partial pixel at all
-    // for a dozen rows, so they read as a dead straight run that suddenly jogs
-    // a whole pixel. Centred on the pixel, those flanks get a real half-covered
-    // column instead. It also matches how the sample below is indexed, by pixel
-    // centre, so the magnified content and the circle share one origin.
-    const centre_x = @as(f64, @floatFromInt(left)) + @as(f64, @floatFromInt(diameter)) / 2.0 + 0.5;
-    const centre_y = @as(f64, @floatFromInt(top)) + @as(f64, @floatFromInt(diameter)) / 2.0 + 0.5;
+    const side: i32 = @intFromFloat(@round(scope_size * ui_scale));
+    const scope = Rect{ .x = window.x, .y = window.y, .w = side, .h = side };
+    canvas.blitNearest(sample, scope);
 
-    // A cell boundary lands at `step * diameter / sample_side`; the first pixel
-    // *of* the next cell is the one at or past it, so this rounds up. Rounding
-    // down drew every grid line one pixel to the left of the cell it divides.
-    var grid: [sample_side]i32 = @splat(0);
-    var step: i32 = 1;
+    const grid_ink = color.black(48);
+    const grid_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
+    var step: u32 = 1;
     while (step < sample_side) : (step += 1) {
-        const scaled = @as(u64, @intCast(step)) * @as(u64, @intCast(diameter));
-        grid[@intCast(step)] = @intCast((scaled + sample_side - 1) / sample_side);
+        const offset = gridOffset(step, side);
+        canvas.blendRect(.{ .x = scope.x + offset, .y = scope.y, .w = grid_width, .h = scope.h }, grid_ink);
+        canvas.blendRect(.{ .x = scope.x, .y = scope.y + offset, .w = scope.w, .h = grid_width }, grid_ink);
     }
 
-    const disc = Disc{
-        .sample = sample,
-        .left = left,
-        .top = top,
-        .diameter = diameter,
-        .grid = grid,
-        .centre_x = centre_x,
-        .centre_y = centre_y,
-        .radius = radius,
-        .ring = ring_thickness * ui_scale,
-        .separator = separator_thickness * ui_scale,
+    // The outer rail is structural; its inner edge is exactly one grid line.
+    const light = color.solid(.{ .r = 0xee, .g = 0xec, .b = 0xed });
+    const outer_light: i32 = @max(1, @as(i32, @intFromFloat(@round(2 * ui_scale))));
+    canvas.strokeRect(scope, outer_light, light);
+    blendFrame(
+        canvas,
+        .{
+            .x = scope.x + outer_light,
+            .y = scope.y + outer_light,
+            .w = scope.w - 2 * outer_light,
+            .h = scope.h - 2 * outer_light,
+        },
+        grid_width,
+        grid_ink,
+    );
+
+    const rgb = hexAt(sample) orelse return;
+    const centre = sample_side / 2;
+    const target_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
+    const target_start = gridOffset(centre, side);
+    const target_end = gridOffset(centre + 1, side);
+    const target = Rect{
+        .x = scope.x + target_start,
+        .y = scope.y + target_start,
+        // Include the far grid line so every edge replaces a line instead of
+        // consuming space inside the hovered pixel.
+        .w = target_end - target_start + target_width,
+        .h = target_end - target_start + target_width,
     };
+    canvas.strokeRect(target, target_width, targetInk(rgb));
 
-    // Walk the radius rather than the rounded bounding square, with the
-    // filter's reach plus a pixel of margin, so the outer half of the coverage
-    // ramp is always inside the loop even when rounding leaves the square a
-    // little tight or lopsided.
-    const reach = radius + filter_radius + 1;
-    const first_x: i32 = @as(i32, @intFromFloat(@floor(centre_x - reach))) - left;
-    const last_x: i32 = @as(i32, @intFromFloat(@ceil(centre_x + reach))) - left;
-    const first_y: i32 = @as(i32, @intFromFloat(@floor(centre_y - reach))) - top;
-    const last_y: i32 = @as(i32, @intFromFloat(@ceil(centre_y + reach))) - top;
+    const text = color.hexString(rgb);
+    const height: i32 = @intFromFloat(@round(plate_height * ui_scale));
+    const plate = Rect{ .x = window.x, .y = window.y + side, .w = side, .h = height };
+    badge.draw(canvas, plate, &text, ui_scale);
 
-    var dy: i32 = first_y;
-    while (dy <= last_y) : (dy += 1) {
-        const py = @as(f64, @floatFromInt(top + dy)) + 0.5 - centre_y;
-        var dx: i32 = first_x;
-        while (dx <= last_x) : (dx += 1) {
-            const px = @as(f64, @floatFromInt(left + dx)) + 0.5 - centre_x;
-            const dist = @sqrt(px * px + py * py);
-            const coverage = discWeight(radius, dist);
-            if (coverage <= 0) continue;
-            canvas.blendCoverageLinear(left + dx, top + dy, disc.pixelAt(dx, dy, dist, coverage), coverage);
+    // The sampled colour is the only chromatic accent in the instrument.
+    const signal_height: i32 = @max(2, @as(i32, @intFromFloat(@round(3 * ui_scale))));
+    canvas.fillRect(
+        .{ .x = plate.x, .y = plate.maxY() - signal_height, .w = plate.w, .h = signal_height },
+        color.solid(rgb),
+    );
+}
+
+fn horizontalCompanion(rect: Rect, target_column: u32) Rect {
+    return .{
+        .x = if (target_column == 0) rect.x - rect.w else rect.maxX(),
+        .y = rect.y,
+        .w = rect.w,
+        .h = rect.h,
+    };
+}
+
+fn verticalCompanion(rect: Rect, target_row: u32) Rect {
+    return .{
+        .x = rect.x,
+        .y = if (target_row == 0) rect.y - rect.h else rect.maxY(),
+        .w = rect.w,
+        .h = rect.h,
+    };
+}
+
+pub fn endpointBounds(rect: Rect, target_column: u32, target_row: u32) Rect {
+    return rect
+        .unionWith(horizontalCompanion(rect, target_column))
+        .unionWith(verticalCompanion(rect, target_row));
+}
+
+/// Draw an L-shaped endpoint scope outside the selection. The sampled endpoint
+/// occupies the cell that physically touches the active box corner; companion
+/// grids extend along both outer edges without covering the capture.
+pub fn renderEndpoint(
+    canvas: *Canvas,
+    rect: Rect,
+    sample: Canvas,
+    ui_scale: f64,
+    target_column: u32,
+    target_row: u32,
+) void {
+    if (rect.isEmpty() or sample.width < endpoint_sample_side or sample.height < endpoint_sample_side) return;
+    if (target_column >= endpoint_sample_side or target_row >= endpoint_sample_side) return;
+
+    const source_x: i32 = @as(i32, @intCast(sample.width / 2)) - @as(i32, @intCast(target_column));
+    const source_y: i32 = @as(i32, @intCast(sample.height / 2)) - @as(i32, @intCast(target_row));
+    const outward_x: i32 = if (target_column == 0) 1 else -1;
+    const outward_y: i32 = if (target_row == 0) 1 else -1;
+
+    const horizontal = horizontalCompanion(rect, target_column);
+    const vertical = verticalCompanion(rect, target_row);
+    renderEndpointTile(canvas, rect, sample, ui_scale, source_x, source_y);
+    renderEndpointTile(
+        canvas,
+        horizontal,
+        sample,
+        ui_scale,
+        source_x - outward_x * @as(i32, @intCast(endpoint_sample_side)),
+        source_y,
+    );
+    renderEndpointTile(
+        canvas,
+        vertical,
+        sample,
+        ui_scale,
+        source_x,
+        source_y - outward_y * @as(i32, @intCast(endpoint_sample_side)),
+    );
+
+    const grid_ink = color.black(48);
+    const grid_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
+    blendFrame(canvas, rect, grid_width, grid_ink);
+    blendFrameEdges(
+        canvas,
+        horizontal,
+        grid_width,
+        grid_ink,
+        true,
+        true,
+        target_column == 0,
+        target_column != 0,
+    );
+    blendFrameEdges(
+        canvas,
+        vertical,
+        grid_width,
+        grid_ink,
+        target_row == 0,
+        target_row != 0,
+        true,
+        true,
+    );
+
+    const rgb = hexAt(sample) orelse return;
+    const target_x = endpointGridOffset(target_column, rect.w);
+    const target_y = endpointGridOffset(target_row, rect.h);
+    const target_max_x = endpointGridOffset(target_column + 1, rect.w);
+    const target_max_y = endpointGridOffset(target_row + 1, rect.h);
+    canvas.strokeRect(
+        .{
+            .x = rect.x + target_x,
+            .y = rect.y + target_y,
+            .w = target_max_x - target_x + grid_width,
+            .h = target_max_y - target_y + grid_width,
+        },
+        grid_width,
+        targetInk(rgb),
+    );
+}
+
+fn renderEndpointTile(
+    canvas: *Canvas,
+    rect: Rect,
+    sample: Canvas,
+    ui_scale: f64,
+    source_x: i32,
+    source_y: i32,
+) void {
+    var y = rect.y;
+    while (y < rect.maxY()) : (y += 1) {
+        const sy = source_y + @divTrunc((y - rect.y) * @as(i32, @intCast(endpoint_sample_side)), rect.h);
+        var x = rect.x;
+        while (x < rect.maxX()) : (x += 1) {
+            const sx = source_x + @divTrunc((x - rect.x) * @as(i32, @intCast(endpoint_sample_side)), rect.w);
+            if (sample.get(sx, sy)) |pixel| canvas.set(x, y, pixel);
         }
     }
 
-    drawHexBadge(canvas, window, sample, ui_scale);
-}
-
-/// Ring width in points. Subpixel coverage keeps this hairline smooth at 1x
-/// while higher-density displays naturally give it more physical pixels.
-pub const ring_thickness: f64 = 1.0;
-/// Inner separator uses the same ink and width as the sample grid.
-pub const separator_thickness: f64 = 1.0;
-
-fn drawHexBadge(canvas: *Canvas, window: Rect, sample: Canvas, ui_scale: f64) void {
-    const rgb = hexAt(sample) orelse return;
-    const text = color.hexString(rgb);
-    drawBadge(canvas, window, &text, ui_scale);
-}
-
-/// Rounded dark pill with white monospace text, horizontally centred in the
-/// window and sitting near its bottom edge.
-fn drawBadge(canvas: *Canvas, window: Rect, text: []const u8, ui_scale: f64) void {
-    const metrics = badge.metrics(text, ui_scale);
-    const width: i32 = @intFromFloat(@round(window_width * ui_scale));
-    const height: i32 = @intFromFloat(@round(window_height * ui_scale));
-    const rect = Rect{
-        .x = window.x + @divTrunc(width - metrics.width, 2),
-        .y = window.y + height - metrics.height - @as(i32, @intFromFloat(@round(2 * ui_scale))),
-        .w = metrics.width,
-        .h = metrics.height,
-    };
-    badge.draw(canvas, rect, text, ui_scale);
+    const grid_ink = color.black(48);
+    const grid_width: i32 = @max(1, @as(i32, @intFromFloat(@round(ui_scale))));
+    var step: u32 = 1;
+    while (step < endpoint_sample_side) : (step += 1) {
+        const offset = endpointGridOffset(step, rect.w);
+        canvas.blendRect(.{ .x = rect.x + offset, .y = rect.y, .w = grid_width, .h = rect.h }, grid_ink);
+        canvas.blendRect(.{ .x = rect.x, .y = rect.y + offset, .w = rect.w, .h = grid_width }, grid_ink);
+    }
 }

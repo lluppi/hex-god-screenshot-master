@@ -136,8 +136,9 @@ pub fn over(dst: u32, src: u32) u32 {
     return (a << 24) | (ga << 8) | rb;
 }
 
-/// Multiply each channel towards black, used for the full screen dim while the
-/// overlay is up. 246/256 == 0.9609, close enough to the mac app's 4% black.
+/// Multiply each channel towards black, used for the full-screen dim while the
+/// instrument is active. 236/256 keeps the desktop legible while making the
+/// undimmed selection read as a distinct optical channel.
 pub fn dimPixel(pixel: u32, numerator: u32) u32 {
     const a: u32 = (pixel >> 24) & 0xff;
     const r = (((pixel >> 16) & 0xff) * numerator) >> 8;
@@ -146,4 +147,4 @@ pub fn dimPixel(pixel: u32, numerator: u32) u32 {
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
-pub const dim_numerator: u32 = 246;
+pub const dim_numerator: u32 = 236;
