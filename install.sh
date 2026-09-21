@@ -2,13 +2,7 @@
 # Build and install the tool.
 #
 #   PREFIX=... ./install.sh    binary into $PREFIX/bin (default ~/.local)
-#
-# The executable is the whole program on both platforms. There is no .app bundle
-# and nothing is signed. On macOS that means Screen Recording is attributed to
-# whatever process launches the overlay rather than to hgsm itself: start it from
-# something already allowed to record the screen (a terminal, or a window manager
-# keybind) instead of from Finder. macOS does not prompt for Screen Recording, so
-# an ungranted launcher just fails.
+
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -45,10 +39,7 @@ install() {
 	path_hint "$prefix/bin"
 
 	if [[ "$os" == macos ]]; then
-		echo "The overlay borrows the Screen Recording grant of whatever launches"
-		echo "it, so run it from a terminal, and from a window manager that you have"
-		echo "granted under Privacy & Security > Screen & System Audio Recording."
-		echo "macOS does not prompt for this, and Finder has no grant at all."
+		echo "Bind a key to $prefix/bin/$EXECUTABLE (aerospace, hammerspoon, skhd, ...)."
 	else
 		echo "For a compositor keybind, point it straight at $prefix/bin/$EXECUTABLE."
 	fi

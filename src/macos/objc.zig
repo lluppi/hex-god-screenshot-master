@@ -140,6 +140,8 @@ pub const CGDirectDisplayID = u32;
 pub const CGImageRef = *anyopaque;
 pub const CGContextRef = *anyopaque;
 pub const CGColorSpaceRef = *anyopaque;
+pub const CGDataProviderRef = *anyopaque;
+pub const CFDataRef = *anyopaque;
 
 pub extern "c" fn CGDisplayCreateImage(display: CGDirectDisplayID) ?CGImageRef;
 pub extern "c" fn CGDisplayCreateImageForRect(
@@ -148,7 +150,15 @@ pub extern "c" fn CGDisplayCreateImageForRect(
 ) ?CGImageRef;
 pub extern "c" fn CGImageGetWidth(image: CGImageRef) usize;
 pub extern "c" fn CGImageGetHeight(image: CGImageRef) usize;
+pub extern "c" fn CGImageGetBitsPerPixel(image: CGImageRef) usize;
+pub extern "c" fn CGImageGetBytesPerRow(image: CGImageRef) usize;
+pub extern "c" fn CGImageGetBitmapInfo(image: CGImageRef) u32;
+pub extern "c" fn CGImageGetDataProvider(image: CGImageRef) ?CGDataProviderRef;
 pub extern "c" fn CGImageRelease(image: CGImageRef) void;
+pub extern "c" fn CGDataProviderCopyData(provider: CGDataProviderRef) ?CFDataRef;
+pub extern "c" fn CFDataGetBytePtr(data: CFDataRef) ?[*]const u8;
+pub extern "c" fn CFDataGetLength(data: CFDataRef) isize;
+pub extern "c" fn CFRelease(object: *anyopaque) void;
 pub extern "c" fn CGColorSpaceCreateDeviceRGB() ?CGColorSpaceRef;
 pub extern "c" fn CGColorSpaceRelease(space: CGColorSpaceRef) void;
 pub extern "c" fn CGBitmapContextCreate(

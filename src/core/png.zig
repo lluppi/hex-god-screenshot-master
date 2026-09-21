@@ -74,7 +74,9 @@ fn deflate(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
     var writer: std.Io.Writer = .fixed(output);
     var window: [flate.max_window_len * 2]u8 = undefined;
-    var compressor = try flate.Compress.init(&writer, &window, .zlib, .default);
+    // Screenshot completion is interactive; favour low latency over a modest
+    // reduction in clipboard and optional saved-file size.
+    var compressor = try flate.Compress.init(&writer, &window, .zlib, .fastest);
     try compressor.writer.writeAll(raw);
     try compressor.finish();
 

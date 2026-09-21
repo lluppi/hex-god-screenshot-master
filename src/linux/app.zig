@@ -21,6 +21,7 @@ const canvas_mod = @import("../core/canvas.zig");
 const color_mod = @import("../core/color.zig");
 const interaction_mod = @import("../core/interaction.zig");
 const png = @import("../core/png.zig");
+const save = @import("../core/save.zig");
 const out = @import("../core/out.zig");
 const cli = @import("../core/cli.zig");
 const sys = @import("../core/sys.zig");
@@ -126,6 +127,9 @@ pub const App = struct {
     /// Logical pixels of cursor movement per unit of raw delta, from `--gain`.
     /// Zero means the compositor's own cursor position drives the overlay.
     gain: f64 = 0.5,
+    /// Directory from `--save-dir`: each screenshot is also written there as a
+    /// PNG. Null means clipboard only, which is the default.
+    save_dir: ?[]const u8 = null,
     /// The compositor reported the lock active. It does not follow that the
     /// pointer is held where it was; see `onPointerLocked`.
     pinned: bool = false,
@@ -223,6 +227,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
         // A synthetic gesture drives the cursor directly, so it must not have a
         // raw-delta cursor racing it.
         .gain = if (dev != .none) 0 else invocation.gain,
+        .save_dir = invocation.save_dir,
     };
     defer wl.wl_display_disconnect(display);
     defer if (app.clip_source) |source| wl.dataSourceDestroy(source);
@@ -262,6 +267,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             var canvas = try captureScreenshot(&app, rect);
             defer canvas.deinit();
             const bytes = try png.encode(allocator, canvas);
+            saveScreenshot(&app, bytes);
             out.print("Screenshot copied to clipboard\n", .{});
             publish(&app, "image/png", bytes);
         },
@@ -732,8 +738,22 @@ fn finishScreenshot(self: *App, rect: FRect) void {
         return;
     };
     defer self.allocator.free(bytes);
+    saveScreenshot(self, bytes);
     out.print("Screenshot copied to clipboard\n", .{});
     publish(self, "image/png", bytes);
+}
+
+/// Write the PNG into `--save-dir` if one was given. The clipboard copy is
+/// unaffected: a failed save is reported and reflected in the exit code, but it
+/// does not stop the paste from working.
+fn saveScreenshot(self: *App, bytes: []const u8) void {
+    const dir = self.save_dir orelse return;
+    const path = save.writePng(self.allocator, dir, bytes) catch |err| {
+        out.fail("could not save screenshot to {s}: {t}\n", .{ dir, err });
+        self.exit_code = 1;
+        return;
+    };
+    out.print("Screenshot saved to {s}\n", .{path});
 }
 
 /// Capture a global logical rectangle. The composition and the single-output

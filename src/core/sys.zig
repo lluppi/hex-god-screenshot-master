@@ -23,6 +23,9 @@ const clock_monotonic: c_int = switch (builtin.os.tag) {
     else => 1,
 };
 
+/// CLOCK_REALTIME, which is 0 on every platform we build for.
+const clock_realtime: c_int = 0;
+
 pub fn writeAll(fd: c_int, bytes: []const u8) void {
     var remaining = bytes;
     while (remaining.len > 0) {
@@ -52,7 +55,17 @@ pub fn truncateFd(fd: c_int, length: u64) !void {
 
 /// Milliseconds from an arbitrary fixed point; only differences are meaningful.
 pub fn monotonicMs() i64 {
+    return readMs(clock_monotonic);
+}
+
+/// Milliseconds since the unix epoch, for stamping a saved screenshot. Zero if
+/// the clock is unavailable, which the caller treats as 1970.
+pub fn realMs() i64 {
+    return readMs(clock_realtime);
+}
+
+fn readMs(clock_id: c_int) i64 {
     var now: TimeSpec = undefined;
-    if (clock_gettime(clock_monotonic, &now) != 0) return 0;
+    if (clock_gettime(clock_id, &now) != 0) return 0;
     return @as(i64, now.tv_sec) * std.time.ms_per_s + @divTrunc(@as(i64, now.tv_nsec), std.time.ns_per_ms);
 }

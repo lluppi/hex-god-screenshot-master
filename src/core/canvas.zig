@@ -18,14 +18,20 @@ pub const Canvas = struct {
     /// the other swapchain buffer keeps stale content there.
     clip: ?Rect = null,
 
-    /// Allocate an owned canvas; release it with `deinit`.
+    /// Allocate an owned, zeroed canvas; release it with `deinit`.
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !Canvas {
-        const pixels = try allocator.alloc(u32, @as(usize, width) * @as(usize, height));
-        @memset(pixels, 0);
+        const canvas = try initUninitialized(allocator, width, height);
+        @memset(canvas.pixels, 0);
+        return canvas;
+    }
+
+    /// Allocate an owned canvas for callers that immediately overwrite every
+    /// pixel. Reading it before that overwrite is invalid.
+    pub fn initUninitialized(allocator: std.mem.Allocator, width: u32, height: u32) !Canvas {
         return .{
             .width = width,
             .height = height,
-            .pixels = pixels,
+            .pixels = try allocator.alloc(u32, @as(usize, width) * @as(usize, height)),
             .allocator = allocator,
         };
     }
@@ -129,6 +135,25 @@ pub const Canvas = struct {
                 self.pixels[dst_start .. dst_start + @as(usize, @intCast(r.w))],
                 src.pixels[src_start .. src_start + @as(usize, @intCast(r.w))],
             );
+        }
+    }
+
+    /// Copy and dim a rectangle in one pass. This avoids writing the baseline
+    /// once for the copy and a second time for the dimming operation.
+    pub fn copyDimmedFrom(self: Canvas, src: Canvas, area: Rect) void {
+        const r = self.work(area).intersection(src.rect());
+        if (r.isEmpty()) return;
+        var y = r.y;
+        while (y < r.maxY()) : (y += 1) {
+            var dst = self.index(r.x, y);
+            const end = dst + @as(usize, @intCast(r.w));
+            var source = src.index(r.x, y);
+            while (dst < end) : ({
+                dst += 1;
+                source += 1;
+            }) {
+                self.pixels[dst] = color.dimPixel(src.pixels[source]);
+            }
         }
     }
 

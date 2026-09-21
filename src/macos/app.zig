@@ -4,8 +4,8 @@
 //! Structurally identical to the Wayland frontend: one borderless window per
 //! display covering it exactly, a baseline grab per display taken with
 //! `CGDisplayCreateImage` before the overlay appears, the same gesture state
-//! machine, the same loupe, and a fresh `CGDisplayCreateImageForRect` grab once
-//! the windows are ordered out for the final screenshot.
+//! machine and the same loupe. Final screenshots crop the baseline the user
+//! selected from, so dismissing the overlay needs no second display capture.
 //!
 //! NOTE: this file cannot be compiled on Linux (no Apple SDK) and has not been
 //! run on macOS yet. It is written against the documented AppKit/CoreGraphics
@@ -23,8 +23,8 @@ const canvas_mod = @import("../core/canvas.zig");
 const color = @import("../core/color.zig");
 const interaction_mod = @import("../core/interaction.zig");
 const png = @import("../core/png.zig");
+const save = @import("../core/save.zig");
 const cli = @import("../core/cli.zig");
-const sys = @import("../core/sys.zig");
 const out = @import("../core/out.zig");
 
 const id = objc.id;
@@ -33,8 +33,6 @@ const Canvas = canvas_mod.Canvas;
 const Rect = geom.Rect;
 const Point = geom.Point;
 const FRect = geom.FRect;
-
-const overlay_settle_ms: u64 = 60;
 
 const Display = struct {
     app: *App,
@@ -46,8 +44,12 @@ const Display = struct {
     scale: f64 = 1,
     /// The display as it was before the overlay appeared.
     baseline: ?Canvas = null,
+    /// Keeps borrowed baseline pixels alive when the capture format is native.
+    baseline_data: ?objc.CFDataRef = null,
     /// Backing store for the overlay window, physical pixels.
     canvas: ?Canvas = null,
+    /// Physical damage waiting to be composed at the next AppKit draw.
+    pending_damage: ?Rect = null,
     window: id = null,
     view: id = null,
 };
@@ -65,6 +67,9 @@ const App = struct {
     /// Logical pixels of cursor movement per unit of the mouse's own delta, from
     /// `--gain`. Zero keeps the pointer driving the cursor, as it always did.
     gain: f64 = 0,
+    /// Directory from `--save-dir`: each screenshot is also written there as a
+    /// PNG. Null means clipboard only, which is the default.
+    save_dir: ?[]const u8 = null,
     pointer_detached: bool = false,
     finished: bool = false,
     exit_code: u8 = 0,
@@ -110,7 +115,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
     const command = invocation.command;
     const dev = invocation.dev;
 
-    var app = App{ .allocator = allocator, .gain = invocation.gain };
+    var app = App{ .allocator = allocator, .gain = invocation.gain, .save_dir = invocation.save_dir };
 
     // NSApplication first: NSScreen is only populated once it exists.
     const application = objc.msgSend(id, objc.class("NSApplication"), objc.sel("sharedApplication"), .{});
@@ -131,6 +136,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
 
     try collectDisplays(&app);
     try captureBaselines(&app);
+    defer releaseBaselineData(&app);
     app.surfaces = try buildSurfaces(&app);
 
     switch (command) {
@@ -147,6 +153,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
         .shot => |rect| {
             const canvas = try captureScreenshot(&app, rect);
             const bytes = try png.encode(allocator, canvas);
+            saveScreenshot(&app, bytes);
             out.print("Screenshot copied to clipboard\n", .{});
             copyPng(bytes);
         },
@@ -158,6 +165,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                     std.process.exit(2);
                 },
             }
+            // Window ordering can invoke drawRect synchronously, so callbacks
+            // must be able to find this app before startOverlay creates them.
+            current_app = &app;
+            defer current_app = null;
             try startOverlay(&app);
             defer {
                 app.interaction.?.deinit();
@@ -166,11 +177,9 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
             hideCursor();
             defer showCursor();
             defer releasePointer(&app);
-            current_app = &app;
             objc.msgSend(void, application, objc.sel("activateIgnoringOtherApps:"), .{true});
             if (updateHoverFromMouse(&app)) |global| _ = beginFinePointer(&app, global);
             objc.msgSend(void, application, objc.sel("run"), .{});
-            current_app = null;
         },
     }
 
@@ -228,17 +237,27 @@ fn collectDisplays(app: *App) !void {
 /// `backingScaleFactor`, so it is the scale of the pixels we actually sample and
 /// crop; it is the single source of truth for `Display.scale`.
 fn captureBaselines(app: *App) !void {
+    errdefer releaseBaselineData(app);
     for (app.displays.items) |display| {
         const image = objc.CGDisplayCreateImage(display.id) orelse {
             out.fail("could not capture display {d}\n", .{display.id});
             return error.CaptureFailed;
         };
         defer objc.CGImageRelease(image);
-        display.baseline = try canvasFromImage(app.allocator, image);
+        const captured = try canvasFromImage(app.allocator, image);
+        display.baseline = captured.canvas;
+        display.baseline_data = captured.data;
         const baseline = display.baseline.?;
         if (display.logical.w > 0) {
             display.scale = @as(f64, @floatFromInt(baseline.width)) / display.logical.w;
         }
+    }
+}
+
+fn releaseBaselineData(app: *App) void {
+    for (app.displays.items) |display| {
+        if (display.baseline_data) |data| objc.CFRelease(data);
+        display.baseline_data = null;
     }
 }
 
@@ -272,14 +291,45 @@ fn printInfo(app: *App) void {
     out.print("fine pointer: mouse deltas\n", .{});
 }
 
-fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !Canvas {
+const ImageCanvas = struct {
+    canvas: Canvas,
+    data: ?objc.CFDataRef = null,
+};
+
+fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !ImageCanvas {
     const width = objc.CGImageGetWidth(image);
     const height = objc.CGImageGetHeight(image);
     if (width == 0 or height == 0) return error.EmptyImage;
 
-    var canvas = try Canvas.init(allocator, @intCast(width), @intCast(height));
-    errdefer canvas.deinit();
+    const row_bytes = width * 4;
+    const byte_length = row_bytes * height;
+    if (objc.CGImageGetBitsPerPixel(image) == 32 and
+        objc.CGImageGetBytesPerRow(image) == row_bytes and
+        objc.CGImageGetBitmapInfo(image) == objc.bitmap_info_argb8888)
+    {
+        if (objc.CGImageGetDataProvider(image)) |provider| {
+            if (objc.CGDataProviderCopyData(provider)) |data| {
+                if (objc.CFDataGetLength(data) >= @as(isize, @intCast(byte_length))) {
+                    if (objc.CFDataGetBytePtr(data)) |bytes| {
+                        const pixels: [*]u32 = @ptrCast(@alignCast(@constCast(bytes)));
+                        return .{
+                            .canvas = .{
+                                .width = @intCast(width),
+                                .height = @intCast(height),
+                                .pixels = pixels[0 .. width * height],
+                                .allocator = allocator,
+                            },
+                            .data = data,
+                        };
+                    }
+                }
+                objc.CFRelease(data);
+            }
+        }
+    }
 
+    var canvas = try Canvas.initUninitialized(allocator, @intCast(width), @intCast(height));
+    errdefer canvas.deinit();
     const space = objc.CGColorSpaceCreateDeviceRGB() orelse return error.NoColorSpace;
     defer objc.CGColorSpaceRelease(space);
     const context = objc.CGBitmapContextCreate(
@@ -287,7 +337,7 @@ fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !Canvas
         width,
         height,
         8,
-        width * 4,
+        row_bytes,
         space,
         objc.bitmap_info_argb8888,
     ) orelse return error.NoContext;
@@ -295,7 +345,7 @@ fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !Canvas
 
     objc.CGContextSetInterpolationQuality(context, objc.interpolation_none);
     objc.CGContextDrawImage(context, objc.CGRect.make(0, 0, @floatFromInt(width), @floatFromInt(height)), image);
-    return canvas;
+    return .{ .canvas = canvas };
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +406,7 @@ fn createWindow(app: *App, display: *Display, view_class: objc.Class, window_cla
     display.view = view;
     const pixel_width: u32 = @intFromFloat(@round(display.logical.w * display.scale));
     const pixel_height: u32 = @intFromFloat(@round(display.logical.h * display.scale));
-    display.canvas = try Canvas.init(app.allocator, pixel_width, pixel_height);
+    display.canvas = try Canvas.initUninitialized(app.allocator, pixel_width, pixel_height);
 
     paintRegion(display, display.canvas.?.rect());
 
@@ -376,25 +426,40 @@ fn hideOverlays(app: *App) void {
 // Painting
 // ---------------------------------------------------------------------------
 
-/// Compose a region into a display's canvas and mark it for redraw.
+/// Accumulate a region for the next AppKit draw instead of recomposing once
+/// per mouse event. AppKit coalesces these invalidations to the display cadence.
 fn paintRegion(display: *Display, region: Rect) void {
-    const canvas = &(display.canvas orelse return);
+    const canvas = display.canvas orelse return;
     const clipped = region.clamped(canvas.width, canvas.height);
     if (clipped.isEmpty()) return;
 
-    const interaction = &(display.app.interaction orelse return);
-    interaction.render(display.interaction_id, canvas, clipped);
+    display.pending_damage = if (display.pending_damage) |pending|
+        pending.unionWith(clipped)
+    else
+        clipped;
 
-    // View coordinates are points and y up.
-    const points = objc.CGRect.make(
-        @as(f64, @floatFromInt(clipped.x)) / display.scale,
-        display.logical.h - @as(f64, @floatFromInt(clipped.maxY())) / display.scale,
-        @as(f64, @floatFromInt(clipped.w)) / display.scale,
-        @as(f64, @floatFromInt(clipped.h)) / display.scale,
-    );
     if (display.view) |view| {
-        objc.msgSend(void, view, objc.sel("setNeedsDisplayInRect:"), .{points});
+        objc.msgSend(void, view, objc.sel("setNeedsDisplayInRect:"), .{viewRectFromCanvasRect(display, clipped)});
     }
+}
+
+/// Convert a physical, top-down canvas rectangle to AppKit points, y up.
+fn viewRectFromCanvasRect(display: *const Display, rect: Rect) objc.CGRect {
+    return objc.CGRect.make(
+        @as(f64, @floatFromInt(rect.x)) / display.scale,
+        display.logical.h - @as(f64, @floatFromInt(rect.maxY())) / display.scale,
+        @as(f64, @floatFromInt(rect.w)) / display.scale,
+        @as(f64, @floatFromInt(rect.h)) / display.scale,
+    );
+}
+
+/// Convert an AppKit dirty rectangle to the physical pixels that cover it.
+fn canvasRectFromViewRect(display: *const Display, rect: objc.CGRect) Rect {
+    const x0: i32 = @intFromFloat(@floor(rect.origin.x * display.scale));
+    const x1: i32 = @intFromFloat(@ceil(rect.maxX() * display.scale));
+    const y0: i32 = @intFromFloat(@floor((display.logical.h - rect.maxY()) * display.scale));
+    const y1: i32 = @intFromFloat(@ceil((display.logical.h - rect.origin.y) * display.scale));
+    return Rect{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
 fn displayForView(view: id) ?*Display {
@@ -438,8 +503,7 @@ fn cancel(app: *App) void {
 fn finish(app: *App, result: interaction_mod.Result) void {
     if (app.finished) return;
     app.finished = true;
-    // Before the capture, not just before exit: the screenshot wants the desktop
-    // back to normal, pointer included.
+    // Restore the system pointer before dismissing the overlay.
     releasePointer(app);
 
     switch (result) {
@@ -453,12 +517,10 @@ fn finish(app: *App, result: interaction_mod.Result) void {
             const hex = color.hexString(rgb);
             out.print("{s}\n", .{hex});
             hideOverlays(app);
-            sys.sleepMs(overlay_settle_ms);
             copyText(&hex);
         },
         .screenshot => |rect| {
             hideOverlays(app);
-            sys.sleepMs(overlay_settle_ms);
             var canvas = captureScreenshot(app, rect) catch |err| {
                 out.fail("screenshot failed: {t}\n", .{err});
                 app.exit_code = 1;
@@ -472,11 +534,25 @@ fn finish(app: *App, result: interaction_mod.Result) void {
                 terminate();
                 return;
             };
+            saveScreenshot(app, bytes);
             out.print("Screenshot copied to clipboard\n", .{});
             copyPng(bytes);
         },
     }
     terminate();
+}
+
+/// Write the PNG into `--save-dir` if one was given, the same as the linux
+/// frontend. The clipboard copy is unaffected: a failed save is reported and
+/// reflected in the exit code, but it does not stop the paste from working.
+fn saveScreenshot(app: *App, bytes: []const u8) void {
+    const dir = app.save_dir orelse return;
+    const path = save.writePng(app.allocator, dir, bytes) catch |err| {
+        out.fail("could not save screenshot to {s}: {t}\n", .{ dir, err });
+        app.exit_code = 1;
+        return;
+    };
+    out.print("Screenshot saved to {s}\n", .{path});
 }
 
 fn terminate() void {
@@ -491,23 +567,36 @@ fn captureScreenshot(app: *App, rect: FRect) !Canvas {
     return interaction_mod.captureScreenshot(app.allocator, app.surfaces, rect, app, captureOne);
 }
 
-/// Capture one display's share of a screenshot. `intersection` is in global
-/// logical coordinates; CGDisplayCreateImageForRect wants display-local points,
-/// y down.
+/// Crop one display's share from the baseline already shown under the overlay.
+/// This is both WYSIWYG and avoids another WindowServer capture after dragging.
 fn captureOne(app: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
     const display = app.displays.items[surface];
-    const request = objc.CGRect.make(
-        intersection.x - display.logical.x,
-        intersection.y - display.logical.y,
-        intersection.w,
-        intersection.h,
+    const baseline = display.baseline.?;
+    const source = Rect.roundF(.{
+        .x = (intersection.x - display.logical.x) * display.scale,
+        .y = (intersection.y - display.logical.y) * display.scale,
+        .w = intersection.w * display.scale,
+        .h = intersection.h * display.scale,
+    }).clamped(baseline.width, baseline.height);
+    if (source.isEmpty()) return error.EmptyCapture;
+
+    var captured = try Canvas.initUninitialized(
+        app.allocator,
+        @intCast(source.w),
+        @intCast(source.h),
     );
-    const image = objc.CGDisplayCreateImageForRect(display.id, request) orelse {
-        out.fail("could not capture display {d}\n", .{display.id});
-        return error.CaptureFailed;
-    };
-    defer objc.CGImageRelease(image);
-    return canvasFromImage(app.allocator, image);
+    errdefer captured.deinit();
+    var row: i32 = 0;
+    while (row < source.h) : (row += 1) {
+        const source_start = baseline.index(source.x, source.y + row);
+        const captured_start = captured.index(0, row);
+        const width: usize = @intCast(source.w);
+        @memcpy(
+            captured.pixels[captured_start .. captured_start + width],
+            baseline.pixels[source_start .. source_start + width],
+        );
+    }
+    return captured;
 }
 
 fn updateHoverFromMouse(app: *App) ?Point {
@@ -610,18 +699,25 @@ fn windowClass() objc.Class {
 fn viewDrawRect(self: id, cmd: SEL, rect: objc.CGRect) callconv(.c) void {
     _ = cmd;
     const display = displayForView(self) orelse return;
-    const canvas = display.canvas orelse return;
+    const canvas = &(display.canvas orelse return);
 
-    const image = cgImageFromCanvas(canvas) orelse return;
+    if (display.pending_damage) |damage| {
+        const interaction = &(display.app.interaction orelse return);
+        interaction.render(display.interaction_id, canvas, damage);
+        display.pending_damage = null;
+    }
+
+    const region = canvasRectFromViewRect(display, rect).clamped(canvas.width, canvas.height);
+    if (region.isEmpty()) return;
+    const image = cgImageFromCanvasRegion(canvas.*, region) orelse return;
     defer objc.CGImageRelease(image);
 
     const graphics_context = objc.msgSend(id, objc.class("NSGraphicsContext"), objc.sel("currentContext"), .{});
     if (graphics_context == null) return;
     const context = objc.msgSend(?*anyopaque, graphics_context, objc.sel("CGContext"), .{}) orelse return;
-    const bounds = objc.msgSend(objc.CGRect, self, objc.sel("bounds"), .{});
     objc.CGContextClipToRect(@ptrCast(context), rect);
     objc.CGContextSetInterpolationQuality(@ptrCast(context), objc.interpolation_none);
-    objc.CGContextDrawImage(@ptrCast(context), bounds, image);
+    objc.CGContextDrawImage(@ptrCast(context), viewRectFromCanvasRect(display, region), image);
 }
 
 extern "c" fn CGImageCreate(
@@ -644,27 +740,44 @@ extern "c" fn CGDataProviderCreateWithData(
     release: ?*const fn (?*anyopaque, ?*const anyopaque, usize) callconv(.c) void,
 ) ?*anyopaque;
 extern "c" fn CGDataProviderRelease(provider: *anyopaque) void;
+extern "c" fn CGImageCreateWithImageInRect(
+    image: objc.CGImageRef,
+    rect: objc.CGRect,
+) ?objc.CGImageRef;
 
-/// Wrap a canvas in a CGImage without copying pixels.
-fn cgImageFromCanvas(canvas: Canvas) ?objc.CGImageRef {
+/// Wrap the canvas without copying, then crop CoreGraphics' view of it to the
+/// dirty region. The full wrapper keeps every row in bounds at the canvas stride.
+fn cgImageFromCanvasRegion(canvas: Canvas, region: Rect) ?objc.CGImageRef {
+    const clipped = region.clamped(canvas.width, canvas.height);
+    if (clipped.isEmpty()) return null;
+
     const space = objc.CGColorSpaceCreateDeviceRGB() orelse return null;
     defer objc.CGColorSpaceRelease(space);
-    const length = @as(usize, canvas.width) * canvas.height * 4;
+    const row_bytes = @as(usize, canvas.width) * 4;
+    const length = row_bytes * canvas.height;
     const provider = CGDataProviderCreateWithData(null, canvas.pixels.ptr, length, null) orelse return null;
     defer CGDataProviderRelease(provider);
-    return CGImageCreate(
+    const image = CGImageCreate(
         canvas.width,
         canvas.height,
         8,
         32,
-        @as(usize, canvas.width) * 4,
+        row_bytes,
         space,
         objc.bitmap_info_argb8888,
         provider,
         null,
         false,
         0,
-    );
+    ) orelse return null;
+    defer objc.CGImageRelease(image);
+
+    return CGImageCreateWithImageInRect(image, objc.CGRect.make(
+        @floatFromInt(clipped.x),
+        @floatFromInt(clipped.y),
+        @floatFromInt(clipped.w),
+        @floatFromInt(clipped.h),
+    ));
 }
 
 fn viewAcceptsFirstResponder(self: id, cmd: SEL) callconv(.c) bool {

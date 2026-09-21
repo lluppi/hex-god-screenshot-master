@@ -158,9 +158,9 @@ pub fn over(dst: u32, src: u32) u32 {
 const dim_numerator: u32 = 236;
 
 pub fn dimPixel(pixel: u32) u32 {
-    const a: u32 = (pixel >> 24) & 0xff;
-    const r = (((pixel >> 16) & 0xff) * dim_numerator) >> 8;
-    const g = (((pixel >> 8) & 0xff) * dim_numerator) >> 8;
-    const b = ((pixel & 0xff) * dim_numerator) >> 8;
-    return (a << 24) | (r << 16) | (g << 8) | b;
+    // Red and blue occupy independent 16-bit lanes, so one multiply dims both
+    // without allowing either product to carry into the other.
+    const rb = (((pixel & 0x00ff00ff) * dim_numerator) >> 8) & 0x00ff00ff;
+    const g = (((pixel & 0x0000ff00) * dim_numerator) >> 8) & 0x0000ff00;
+    return (pixel & 0xff000000) | g | rb;
 }

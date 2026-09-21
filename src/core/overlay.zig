@@ -51,8 +51,7 @@ pub fn renderRegion(canvas: *Canvas, scene: Scene, region: Rect) void {
 }
 
 fn paintBaseline(canvas: *Canvas, scene: Scene, region: Rect) void {
-    canvas.copyFrom(scene.baseline.*, region);
-    canvas.dim(region);
+    canvas.copyDimmedFrom(scene.baseline.*, region);
 }
 
 fn paintSelection(canvas: *Canvas, scene: Scene, selection: Rect, region: Rect) void {

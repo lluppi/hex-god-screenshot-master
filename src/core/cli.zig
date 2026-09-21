@@ -60,7 +60,7 @@ pub const Dev = union(enum) {
 const dev_hold_default_ms: u64 = 1000;
 
 pub const Parsed = union(enum) {
-    run: struct { command: Command, dev: Dev, gain: f64 },
+    run: struct { command: Command, dev: Dev, gain: f64, save_dir: ?[]const u8 },
     help,
     version,
     invalid: []const u8,
@@ -74,6 +74,7 @@ pub fn parse(args: []const []const u8) Parsed {
     var via: ?geom.Point = null;
     var hold_ms: u64 = dev_hold_default_ms;
     var gain: f64 = default_gain;
+    var save_dir: ?[]const u8 = null;
 
     var rest = Cursor{ .items = args };
     while (rest.next()) |arg| {
@@ -83,6 +84,10 @@ pub fn parse(args: []const []const u8) Parsed {
         } else if (std.mem.eql(u8, arg, "--shot")) {
             const value = rest.next() orelse return .{ .invalid = "--shot needs X,Y,W,H" };
             command = .{ .shot = parseRect(value) orelse return .{ .invalid = "--shot needs X,Y,W,H" } };
+        } else if (std.mem.eql(u8, arg, "--save-dir")) {
+            const value = rest.next() orelse return .{ .invalid = "--save-dir needs a directory" };
+            if (value.len == 0) return .{ .invalid = "--save-dir needs a directory" };
+            save_dir = value;
         } else if (std.mem.eql(u8, arg, "--info")) {
             command = .info;
         } else if (std.mem.eql(u8, arg, "--gain")) {
@@ -125,7 +130,12 @@ pub fn parse(args: []const []const u8) Parsed {
         .{ .click = point }
     else
         .none;
-    return .{ .run = .{ .command = command, .dev = dev, .gain = gain } };
+    return .{ .run = .{
+        .command = command,
+        .dev = dev,
+        .gain = gain,
+        .save_dir = save_dir,
+    } };
 }
 
 /// Step through the argument list, so a flag can take the value that follows it.
@@ -174,6 +184,8 @@ pub fn printUsage() void {
         \\  (no option)          overlay: hover to inspect, click for hex, drag for a screenshot
         \\  --pick X,Y           print and copy the hex of a pixel, in logical coordinates
         \\  --shot X,Y,W,H       copy a logical rectangle as a PNG screenshot
+        \\  --save-dir DIR       also write each screenshot into DIR as a PNG, named
+        \\                       hgsm-<date>-<time>.png, alongside the clipboard copy
         \\  --gain N             overlay cursor speed, in logical pixels per raw pointer
         \\                       delta (default 0.5). 1 matches the compositor's own
         \\                       cursor, lower is finer, and 0 is --no-fine
