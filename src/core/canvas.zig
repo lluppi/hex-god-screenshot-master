@@ -36,8 +36,8 @@ pub const Canvas = struct {
         };
     }
 
-    /// Only for canvases from `init`. A borrowed view over memory someone else
-    /// owns (an shm buffer) must never reach here.
+    /// Only for canvases from `init` or `initUninitialized`. A borrowed view
+    /// over memory someone else owns (an shm buffer) must never reach here.
     pub fn deinit(self: *Canvas) void {
         self.allocator.free(self.pixels);
         self.* = undefined;

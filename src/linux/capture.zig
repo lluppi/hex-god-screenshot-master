@@ -1,11 +1,8 @@
 //! Screen capture through `zwlr_screencopy_manager_v1`.
 //!
-//! Three uses:
-//!   * one full-output grab per display at startup (the baseline everything is
-//!     composed and sampled from),
-//!   * one region grab per display when a drag finishes,
-//!   * nothing at all for the live loupe, which magnifies the baseline - that is
-//!     what keeps the loupe from capturing its own overlay.
+//! One full-output grab per display at startup provides the baseline everything
+//! is composed, sampled, and finally cropped from. The live loupe and completed
+//! screenshots therefore show exactly the desktop seen when the program began.
 //!
 //! The protocol wants regions in *output logical* coordinates; the buffers that
 //! come back are in physical pixels.
@@ -105,6 +102,7 @@ pub fn capture(
     region: ?FRect,
 ) Error!shm.ShmBuffer {
     var context = FrameReader{ .shm = shm_obj, .shm_version = shm_version };
+    errdefer context.buffer.destroy();
     const frame = if (region) |requested| blk: {
         const x: i32 = @intFromFloat(@floor(requested.x));
         const y: i32 = @intFromFloat(@floor(requested.y));
@@ -138,7 +136,7 @@ pub fn capture(
 /// Copy a captured shm buffer into a canvas, normalising the compositor's
 /// pixel format and honouring a stride that is not tightly packed.
 pub fn toCanvas(allocator: std.mem.Allocator, captured: *shm.ShmBuffer) Error!Canvas {
-    var canvas = try Canvas.init(allocator, captured.width, captured.height);
+    var canvas = try Canvas.initUninitialized(allocator, captured.width, captured.height);
     errdefer canvas.deinit();
 
     const bytes = captured.memory.?;

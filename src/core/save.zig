@@ -8,6 +8,7 @@ const std = @import("std");
 const sys = @import("sys.zig");
 
 /// Write `bytes` as a PNG inside `dir` and return the path that was written.
+/// The caller owns the returned path and must free it with `allocator`.
 ///
 /// The name is `hgsm-YYYYMMDD-HHMMSS-mmm.png` in UTC, so a directory listing
 /// sorts by capture order. An existing name is never overwritten: the file is
@@ -38,6 +39,7 @@ pub fn writePng(
             .CREAT = true,
             .EXCL = true,
             .CLOEXEC = true,
+            .NOFOLLOW = true,
         }, @as(std.posix.mode_t, 0o644)) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(path);

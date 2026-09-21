@@ -42,6 +42,8 @@ const Display = struct {
     logical: FRect = .{},
     /// Physical pixels per logical pixel.
     scale: f64 = 1,
+    /// AppKit colour space for this physical display.
+    color_space: id = null,
     /// The display as it was before the overlay appeared.
     baseline: ?Canvas = null,
     /// Keeps borrowed baseline pixels alive when the capture format is native.
@@ -136,7 +138,7 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
 
     try collectDisplays(&app);
     try captureBaselines(&app);
-    defer releaseBaselineData(&app);
+    defer releaseBaselines(&app);
     app.surfaces = try buildSurfaces(&app);
 
     switch (command) {
@@ -230,6 +232,7 @@ fn collectDisplays(app: *App) !void {
                 .h = frame.size.height,
             },
             .scale = 1,
+            .color_space = objc.msgSend(id, screen, objc.sel("colorSpace"), .{}),
         };
         try app.displays.append(app.allocator, display);
     }
@@ -241,7 +244,7 @@ fn collectDisplays(app: *App) !void {
 /// `backingScaleFactor`, so it is the scale of the pixels we actually sample and
 /// crop; it is the single source of truth for `Display.scale`.
 fn captureBaselines(app: *App) !void {
-    errdefer releaseBaselineData(app);
+    errdefer releaseBaselines(app);
     for (app.displays.items) |display| {
         const image = objc.CGDisplayCreateImage(display.id) orelse {
             out.fail("could not capture display {d}\n", .{display.id});
@@ -258,9 +261,14 @@ fn captureBaselines(app: *App) !void {
     }
 }
 
-fn releaseBaselineData(app: *App) void {
+fn releaseBaselines(app: *App) void {
     for (app.displays.items) |display| {
-        if (display.baseline_data) |data| objc.CFRelease(data);
+        if (display.baseline_data) |data| {
+            objc.CFRelease(data);
+        } else if (display.baseline) |*baseline| {
+            baseline.deinit();
+        }
+        display.baseline = null;
         display.baseline_data = null;
     }
 }
@@ -307,24 +315,47 @@ fn canvasFromImage(allocator: std.mem.Allocator, image: objc.CGImageRef) !ImageC
 
     const row_bytes = width * 4;
     const byte_length = row_bytes * height;
-    if (objc.CGImageGetBitsPerPixel(image) == 32 and
+    const bitmap_info = objc.CGImageGetBitmapInfo(image);
+    const alpha_info = bitmap_info & objc.bitmap_alpha_mask;
+    const native_layout = objc.CGImageGetBitsPerPixel(image) == 32 and
         objc.CGImageGetBytesPerRow(image) == row_bytes and
-        objc.CGImageGetBitmapInfo(image) == objc.bitmap_info_argb8888)
-    {
+        bitmap_info & objc.bitmap_byte_order_mask == objc.bitmap_byte_order_32_little and
+        bitmap_info & objc.bitmap_float_components == 0;
+    if (native_layout) {
         if (objc.CGImageGetDataProvider(image)) |provider| {
             if (objc.CGDataProviderCopyData(provider)) |data| {
                 if (objc.CFDataGetLength(data) >= @as(isize, @intCast(byte_length))) {
                     if (objc.CFDataGetBytePtr(data)) |bytes| {
-                        const pixels: [*]u32 = @ptrCast(@alignCast(@constCast(bytes)));
-                        return .{
-                            .canvas = .{
-                                .width = @intCast(width),
-                                .height = @intCast(height),
-                                .pixels = pixels[0 .. width * height],
-                                .allocator = allocator,
-                            },
-                            .data = data,
-                        };
+                        if (alpha_info == objc.bitmap_alpha_premultiplied_first and
+                            @intFromPtr(bytes) % @alignOf(u32) == 0)
+                        {
+                            const pixels: [*]u32 = @ptrCast(@alignCast(@constCast(bytes)));
+                            return .{
+                                .canvas = .{
+                                    .width = @intCast(width),
+                                    .height = @intCast(height),
+                                    .pixels = pixels[0 .. width * height],
+                                    .allocator = undefined,
+                                },
+                                .data = data,
+                            };
+                        }
+                        if (alpha_info == objc.bitmap_alpha_none_skip_first) {
+                            const canvas = Canvas.initUninitialized(
+                                allocator,
+                                @intCast(width),
+                                @intCast(height),
+                            ) catch |err| {
+                                objc.CFRelease(data);
+                                return err;
+                            };
+                            const source = std.mem.bytesAsSlice(u32, bytes[0..byte_length]);
+                            for (source, canvas.pixels) |pixel, *destination| {
+                                destination.* = pixel | 0xff000000;
+                            }
+                            objc.CFRelease(data);
+                            return .{ .canvas = canvas };
+                        }
                     }
                 }
                 objc.CFRelease(data);
@@ -393,9 +424,11 @@ fn createWindow(app: *App, display: *Display, view_class: objc.Class, window_cla
     // into a floating-point backing store on the CPU at first presentation.
     objc.msgSend(void, window, objc.sel("setDynamicDepthLimit:"), .{false});
     objc.msgSend(void, window, objc.sel("setDepthLimit:"), .{objc.window_depth_rgb8});
-    objc.msgSend(void, window, objc.sel("setColorSpace:"), .{
-        objc.msgSend(id, objc.class("NSColorSpace"), objc.sel("deviceRGBColorSpace"), .{}),
-    });
+    const color_space = if (display.color_space != null)
+        display.color_space
+    else
+        objc.msgSend(id, objc.class("NSColorSpace"), objc.sel("deviceRGBColorSpace"), .{});
+    objc.msgSend(void, window, objc.sel("setColorSpace:"), .{color_space});
     objc.msgSend(void, window, objc.sel("setLevel:"), .{objc.window_level_screen_saver});
     objc.msgSend(void, window, objc.sel("setOpaque:"), .{false});
     objc.msgSend(void, window, objc.sel("setHasShadow:"), .{false});
@@ -576,6 +609,7 @@ fn saveScreenshot(app: *App, bytes: []const u8) void {
         app.exit_code = 1;
         return;
     };
+    defer app.allocator.free(path);
     out.print("Screenshot saved to {s}\n", .{path});
 }
 

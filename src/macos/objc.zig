@@ -183,9 +183,15 @@ pub extern "c" fn CGRequestScreenCaptureAccess() bool;
 pub extern "c" fn CGAssociateMouseAndMouseCursorPosition(connected: c_int) c_int;
 pub extern "c" fn CGWarpMouseCursorPosition(position: CGPoint) c_int;
 
+pub const bitmap_alpha_mask: u32 = 0x1f;
+pub const bitmap_alpha_premultiplied_first: u32 = 2;
+pub const bitmap_alpha_none_skip_first: u32 = 6;
+pub const bitmap_float_components: u32 = 1 << 8;
+pub const bitmap_byte_order_mask: u32 = 0x7000;
+pub const bitmap_byte_order_32_little: u32 = 2 << 12;
 /// `kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little`: the byte
 /// order that matches the core's ARGB8888 pixels on little endian.
-pub const bitmap_info_argb8888: u32 = (2) | (2 << 12);
+pub const bitmap_info_argb8888: u32 = bitmap_alpha_premultiplied_first | bitmap_byte_order_32_little;
 
 pub const interpolation_none: c_int = 0;
 

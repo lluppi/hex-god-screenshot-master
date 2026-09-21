@@ -6,8 +6,8 @@
 //!   * wl_pointer drives hover (loupe), click (hex) and drag (selection),
 //!   * the loupe magnifies the baseline grab, never a live capture, which is
 //!     what stops it from magnifying its own overlay,
-//!   * the final screenshot is a fresh `zwlr_screencopy` grab taken after the
-//!     overlay has been unmapped, so it shows the desktop, not our dimming,
+//!   * the final screenshot is cropped from the startup baseline, so it shows
+//!     the desktop exactly as it was when the program began, not our dimming,
 //!   * the result is published on the clipboard through a `wl_data_source` and
 //!     the process lingers until the paste happens or another client takes the
 //!     selection.
@@ -46,7 +46,6 @@ const evdev_shift_r: u32 = 54;
 /// mid selection) without a mouse or an input injector on the box.
 const clipboard_timeout_ms: i64 = 60_000;
 const clipboard_idle_after_send_ms: i64 = 5_000;
-const overlay_settle_ms: u64 = 60;
 
 const Output = struct {
     app: *App,
@@ -515,14 +514,6 @@ fn teardownOverlay(self: *App) void {
     self.overlays_up = false;
 }
 
-/// Wait for the compositor to actually drop our surfaces, then capture. Best
-/// effort: if the compositor has gone away the capture that follows reports it.
-fn settle(self: *App) void {
-    roundtrip(self) catch {};
-    sys.sleepMs(overlay_settle_ms);
-    roundtrip(self) catch {};
-}
-
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
@@ -701,10 +692,7 @@ fn finish(self: *App, result: interaction_mod.Result) void {
             };
             const hex = color_mod.hexString(rgb);
             out.print("{s}\n", .{hex});
-            // The overlay has to be gone before the clipboard paste happens,
-            // or the user pastes our own dimming.
             teardownOverlay(self);
-            settle(self);
             publish(self, "text/plain;charset=utf-8", &hex);
         },
         .screenshot => |rect| {
@@ -720,10 +708,9 @@ fn fail(self: *App, message: []const u8) void {
     self.quit = true;
 }
 
-/// Copy a drag selection and publish it, after the overlay is out of the way.
+/// Copy a drag selection from the startup baseline and publish it.
 fn finishScreenshot(self: *App, rect: FRect) void {
     teardownOverlay(self);
-    settle(self);
     var canvas = captureScreenshot(self, rect) catch |err| {
         out.fail("screenshot failed: {t}\n", .{err});
         self.exit_code = 1;
@@ -753,6 +740,7 @@ fn saveScreenshot(self: *App, bytes: []const u8) void {
         self.exit_code = 1;
         return;
     };
+    defer self.allocator.free(path);
     out.print("Screenshot saved to {s}\n", .{path});
 }
 
@@ -763,30 +751,35 @@ fn captureScreenshot(self: *App, rect: FRect) !Canvas {
     return interaction_mod.captureScreenshot(self.allocator, self.surfaces, rect, self, captureOne);
 }
 
-/// Capture one output's share of a screenshot. `intersection` is in global
-/// logical coordinates; the protocol wants it output-local.
+/// Crop one output's share from the baseline captured when the program started.
 fn captureOne(self: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
-    const o = self.outputs.items[surface];
-    const local = FRect{
-        .x = intersection.x - o.logical.x,
-        .y = intersection.y - o.logical.y,
-        .w = intersection.w,
-        .h = intersection.h,
-    };
-    var captured = capture.capture(
-        self.display,
-        self.screencopy.?,
-        self.screencopy_version,
-        self.shm.?,
-        self.shm_version,
-        o.wl_output,
-        local,
-    ) catch |err| {
-        out.fail("capture of a display region failed: {t}\n", .{err});
-        return err;
-    };
-    defer captured.destroy();
-    return capture.toCanvas(self.allocator, &captured);
+    const output = self.outputs.items[surface];
+    const baseline = output.baseline.?;
+    const source = Rect.roundF(.{
+        .x = (intersection.x - output.logical.x) * output.scale,
+        .y = (intersection.y - output.logical.y) * output.scale,
+        .w = intersection.w * output.scale,
+        .h = intersection.h * output.scale,
+    }).clamped(baseline.width, baseline.height);
+    if (source.isEmpty()) return error.EmptyCapture;
+
+    var captured = try Canvas.initUninitialized(
+        self.allocator,
+        @intCast(source.w),
+        @intCast(source.h),
+    );
+    errdefer captured.deinit();
+    var row: i32 = 0;
+    while (row < source.h) : (row += 1) {
+        const source_start = baseline.index(source.x, source.y + row);
+        const captured_start = captured.index(0, row);
+        const width: usize = @intCast(source.w);
+        @memcpy(
+            captured.pixels[captured_start .. captured_start + width],
+            baseline.pixels[source_start .. source_start + width],
+        );
+    }
+    return captured;
 }
 
 // ---------------------------------------------------------------------------

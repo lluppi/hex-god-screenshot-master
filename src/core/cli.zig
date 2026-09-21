@@ -185,7 +185,7 @@ pub fn printUsage() void {
         \\  --pick X,Y           print and copy the hex of a pixel, in logical coordinates
         \\  --shot X,Y,W,H       copy a logical rectangle as a PNG screenshot
         \\  --save-dir DIR       also write each screenshot into DIR as a PNG, named
-        \\                       hgsm-<date>-<time>.png, alongside the clipboard copy
+        \\                       hgsm-YYYYMMDD-HHMMSS-mmm.png, alongside the clipboard copy
         \\  --gain N             overlay cursor speed, in logical pixels per raw pointer
         \\                       delta (default 0.5). 1 matches the compositor's own
         \\                       cursor, lower is finer, and 0 is --no-fine

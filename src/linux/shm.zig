@@ -98,6 +98,7 @@ pub const ShmBuffer = struct {
 
         const pool = wl.shmCreatePool(shm, shm_version, fd, @intCast(size)) orelse
             return error.CreatePoolFailed;
+        errdefer wl.shmPoolDestroy(pool);
         const buffer = wl.shmPoolCreateBuffer(
             pool,
             shm_version,

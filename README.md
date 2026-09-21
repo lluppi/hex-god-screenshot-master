@@ -39,6 +39,10 @@ hyprland provide. gnome and kde wayland do not - says so and exits
 ./install.sh    # into ~/.local/bin
 ```
 
+this installs a bare command-line binary rather than an app bundle. macos screen
+recording permission is therefore associated with the terminal or window manager
+that launches `hgsm`; grant access to that launcher if macos prompts for it.
+
 bind it in your window manager, for example aerospace:
 
 ```toml
@@ -51,12 +55,15 @@ cmd-s = 'exec-and-forget ~/.local/bin/hgsm'
 hgsm                # the overlay
 hgsm --pick X,Y     # print and copy the hex of a pixel
 hgsm --shot X,Y,W,H # copy a rectangle as a PNG
-hgsm --save-dir DIR # save each PNG screenshot to DIR (hgsm-<date>-<time>.png)
+hgsm --save-dir DIR # save each PNG to DIR (hgsm-YYYYMMDD-HHMMSS-mmm.png)
 hgsm --gain N       # overlay cursor speed (default 0.5)
 hgsm --no-fine      # let the compositor's cursor drive the overlay
 hgsm --info         # outputs/displays, their scales, the fine pointer protocols
 hgsm --version      # the version
 ```
+
+the overlay and resulting screenshot use the desktop captured when `hgsm` starts,
+so animated or changing content stays consistent with what was shown while selecting.
 
 `--pick` and `--shot` take logical coordinates, which is what compositors and the
 mac window server report for the cursor, so they compose with anything that can
