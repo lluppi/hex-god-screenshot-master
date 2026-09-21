@@ -78,6 +78,7 @@ fn linkPlatform(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.
             module.linkFramework("AppKit", .{});
             module.linkFramework("Foundation", .{});
             module.linkFramework("CoreGraphics", .{});
+            module.linkFramework("QuartzCore", .{});
             module.linkSystemLibrary("objc", .{});
         },
         else => std.debug.panic(

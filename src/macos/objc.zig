@@ -197,6 +197,8 @@ pub const application_activation_policy_accessory: NSInteger = 1;
 
 pub const window_style_borderless: NSUInteger = 0;
 pub const backing_store_buffered: NSUInteger = 2;
+/// NSWindowDepthTwentyfourBitRGB: 8-bit colour components, matching Canvas.
+pub const window_depth_rgb8: i32 = 0x208;
 pub const window_level_screen_saver: NSInteger = 1000;
 pub const collection_behavior_can_join_all_spaces: NSUInteger = 1 << 0;
 pub const collection_behavior_full_screen_auxiliary: NSUInteger = 1 << 8;

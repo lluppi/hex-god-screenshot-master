@@ -174,11 +174,15 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                 app.interaction.?.deinit();
                 app.interaction = null;
             }
+            // Seed the loupe before presenting any window, then submit the
+            // first frames before taking the system cursor away.
+            const initial_cursor = updateHoverFromMouse(&app);
+            objc.msgSend(void, application, objc.sel("activateIgnoringOtherApps:"), .{true});
+            showOverlays(&app);
             hideCursor();
             defer showCursor();
             defer releasePointer(&app);
-            objc.msgSend(void, application, objc.sel("activateIgnoringOtherApps:"), .{true});
-            if (updateHoverFromMouse(&app)) |global| _ = beginFinePointer(&app, global);
+            if (initial_cursor) |global| _ = beginFinePointer(&app, global);
             objc.msgSend(void, application, objc.sel("run"), .{});
         },
     }
@@ -384,6 +388,14 @@ fn createWindow(app: *App, display: *Display, view_class: objc.Class, window_cla
     });
     if (window == null) return error.WindowFailed;
 
+    // Canvas is device RGB with 8-bit components. Let WindowServer handle the
+    // final display conversion instead of expanding both full-screen images
+    // into a floating-point backing store on the CPU at first presentation.
+    objc.msgSend(void, window, objc.sel("setDynamicDepthLimit:"), .{false});
+    objc.msgSend(void, window, objc.sel("setDepthLimit:"), .{objc.window_depth_rgb8});
+    objc.msgSend(void, window, objc.sel("setColorSpace:"), .{
+        objc.msgSend(id, objc.class("NSColorSpace"), objc.sel("deviceRGBColorSpace"), .{}),
+    });
     objc.msgSend(void, window, objc.sel("setLevel:"), .{objc.window_level_screen_saver});
     objc.msgSend(void, window, objc.sel("setOpaque:"), .{false});
     objc.msgSend(void, window, objc.sel("setHasShadow:"), .{false});
@@ -409,9 +421,21 @@ fn createWindow(app: *App, display: *Display, view_class: objc.Class, window_cla
     display.canvas = try Canvas.initUninitialized(app.allocator, pixel_width, pixel_height);
 
     paintRegion(display, display.canvas.?.rect());
-
-    objc.msgSend(void, window, objc.sel("makeKeyAndOrderFront:"), .{@as(id, null)});
     objc.msgSend(void, window, objc.sel("makeFirstResponder:"), .{view});
+}
+
+/// Present the initial loupe with the background before hiding the system
+/// cursor. Waiting for NSApplication.run to draw leaves a cursorless gap.
+fn showOverlays(app: *App) void {
+    for (app.displays.items) |display| {
+        const window = display.window orelse continue;
+        objc.msgSend(void, window, objc.sel("makeKeyAndOrderFront:"), .{@as(id, null)});
+        objc.msgSend(void, window, objc.sel("displayIfNeeded"), .{});
+        objc.msgSend(void, window, objc.sel("flushWindow"), .{});
+    }
+    // Modern AppKit records display lists: flushWindow alone can return before
+    // drawRect runs. Commit the backing-layer draws too, before hiding the cursor.
+    objc.msgSend(void, objc.class("CATransaction"), objc.sel("flush"), .{});
 }
 
 fn hideOverlays(app: *App) void {
