@@ -58,6 +58,11 @@ fn addExe(
             .target = target,
             .optimize = optimize,
             .link_libc = link_libc,
+            // The released linux binary was 4.4MB of which 3.7MB was DWARF; the
+            // mac builds carry none at all, so the asset sizes were nonsense
+            // next to each other. Nobody debugs a keybind, so release builds are
+            // stripped; `-Doptimize=Debug` still carries full symbols.
+            .strip = optimize != .Debug,
         }),
     });
 }
