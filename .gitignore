@@ -2,3 +2,5 @@
 zig-out/
 .build/
 .DS_Store
+dist/
+out/

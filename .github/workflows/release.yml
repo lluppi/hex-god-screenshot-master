@@ -1,0 +1,98 @@
+# Tag a commit and github does the rest:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# Every job builds on the runner that matches the OS, because zig links the
+# platform's own frameworks/libs and only does that natively: pass -Dtarget on a
+# mac and zig looks in its bundled sdk, which ships nothing but libSystem.tbd,
+# so `-lobjc` and the AppKit/CoreGraphics frameworks go missing. Cross targets
+# that need no system sdk (windows-gnu) are fine anywhere, so windows rides
+# along on linux.
+#
+# The tag should match `version` in src/core/cli.zig - `hgsm --version` and the
+# release name have to agree or the download page lies.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: builds every artifact and uploads them as run artifacts without
+  # touching a release. Use this to check a change before cutting a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04, not -latest: the binary links the runner's glibc, and
+          # 22.04's glibc 2.35 keeps it launchable on debian 12 / ubuntu 22.04,
+          # which -latest's 2.39 would shut out. Needs the wayland + xkbcommon
+          # dev packages for the linker.
+          - runner: ubuntu-22.04
+            target: native
+            asset: hgsm-linux-x86_64
+            packages: libwayland-dev libxkbcommon-dev
+          # windows-gnu pulls user32/gdi32 from zig's bundled mingw: no sdk,
+          # no cross toolchain, works from linux. The .pdb is build noise.
+          - runner: ubuntu-22.04
+            target: x86_64-windows-gnu
+            asset: hgsm-windows-x86_64.exe
+            packages: ""
+          - runner: macos-15
+            target: native
+            asset: hgsm-macos-arm64
+            packages: ""
+          - runner: macos-15-intel
+            target: native
+            asset: hgsm-macos-x86_64
+            packages: ""
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: install system deps
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: build
+        run: |
+          opts="-Doptimize=ReleaseFast --prefix dist"
+          if [ "${{ matrix.target }}" != native ]; then
+            opts="-Dtarget=${{ matrix.target }} $opts"
+          fi
+          zig build $opts
+
+      - name: stage asset
+        run: |
+          mkdir -p out
+          case "${{ matrix.asset }}" in
+            *.exe) cp dist/bin/hgsm.exe "out/${{ matrix.asset }}" ;;
+            *) cp dist/bin/hgsm "out/${{ matrix.asset }}" ;;
+          esac
+          shasum -a 256 "out/${{ matrix.asset }}" \
+            || sha256sum "out/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+
+      # One job per asset all pointing at the same tag: the action creates the
+      # release on the first one and adds files to it after that.
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: out/${{ matrix.asset }}
+          generate_release_notes: true
