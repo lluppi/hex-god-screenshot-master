@@ -103,21 +103,19 @@ jobs:
           path: out
           merge-multiple: true
 
+      # The generated notes are the whole body, nothing hand-written. github
+      # hardcodes the heading as "**Full Changelog**", so the notes are fetched
+      # here instead of with generate_release_notes: to lowercase it.
+      - name: changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" -q .body \
+            | sed 's/\*\*Full Changelog\*\*/**changelog**/' > notes.md
+          cat notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*
-          generate_release_notes: true
-          # The action appends the generated changelog after this body, so the
-          # download page leads with which file to grab.
-          body: |
-            click a pixel to copy its hex, drag a rectangle to copy the shot.
-
-            - `hgsm-linux-x86_64` - wayland. needs `libwayland-client` and
-              `libxkbcommon`, and a wlroots or hyprland compositor.
-            - `hgsm-macos-arm64` - apple silicon.
-            - `hgsm-macos-x86_64` - intel. both mac builds need screen
-              recording permission for whatever launches them.
-            - `hgsm-windows-x86_64.exe` - bind it in powertoys.
-
-            bare binaries, not app bundles and not installers: `chmod +x`,
-            drop it on `PATH`, bind a key to it.
+          body_path: notes.md
