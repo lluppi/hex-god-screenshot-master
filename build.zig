@@ -16,6 +16,17 @@ pub fn build(b: *std.Build) void {
 
     const exe = addExe(b, "hgsm", "src/main.zig", target, optimize, true);
     linkPlatform(b, exe.root_module, target.result.os.tag);
+    if (target.result.os.tag == .windows) {
+        // The overlay is launched from a keybind, so the binary must not be a
+        // console application: windows would flash a console window on every
+        // screenshot. It is built as a windows binary and attaches itself to a
+        // parent console when it is run from one, which keeps `--pick`,
+        // `--info` and `--version` printing where a shell can see it.
+        exe.subsystem = .windows;
+        // Declares per-monitor-v2 DPI awareness before a single line of code
+        // runs, so even the first frame is laid out against real device pixels.
+        exe.win32_manifest = b.path("src/windows/hgsm.manifest");
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -81,8 +92,15 @@ fn linkPlatform(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.
             module.linkFramework("QuartzCore", .{});
             module.linkSystemLibrary("objc", .{});
         },
+        .windows => {
+            // Hand-written externs, the windows counterpart of src/macos/objc.zig:
+            // no SDK, no @cImport, and the linux and macos builds carry nothing
+            // for it. kernel32 and ntdll come with the target.
+            module.linkSystemLibrary("user32", .{});
+            module.linkSystemLibrary("gdi32", .{});
+        },
         else => std.debug.panic(
-            "hgsm supports linux (wayland) and macos; target is {s}",
+            "hgsm supports linux (wayland), macos and windows; target is {s}",
             .{@tagName(os_tag)},
         ),
     }

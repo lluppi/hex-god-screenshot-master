@@ -25,8 +25,20 @@ pub const Result = gesture.Result;
 pub const Surface = struct {
     logical: FRect,
     scale: f64,
+    /// Points to physical pixels, for the instrument: the loupe's size, the
+    /// badges' text, the edge widths. Zero means "whatever `scale` is", which is
+    /// right for every platform whose logical space is a per-output space.
+    /// Windows is the one that needs it separate: its logical space is the
+    /// virtualised desktop, scaled by a single system-wide factor, while the
+    /// scaling the instrument follows is the monitor's own.
+    ui_scale: f64 = 0,
     baseline: *const Canvas,
 };
+
+/// The surface's instrument scale, defaulting to its coordinate scale.
+fn uiScale(config: Surface) f64 {
+    return if (config.ui_scale > 0) config.ui_scale else config.scale;
+}
 
 pub const Damage = struct {
     surface: SurfaceId,
@@ -346,12 +358,20 @@ pub const Interaction = struct {
             .selection = self.selectionPhysical(surface, self.coordinator.selection),
             .cursor = self.cursorPhysical(surface),
             .endpoint_sample = if (self.coordinator.isSelecting()) self.sample else null,
-            .ui_scale = config.scale,
+            .ui_scale = uiScale(config),
         }, region);
 
         if (self.loupe) |loupe| {
             if (loupe.surface == surface) {
-                overlay.renderMagnifier(canvas, loupe.origin, self.sample, config.scale);
+                // The scope is drawn inside the region too, not over the whole
+                // canvas. `renderRegion` clears its clip on the way out, and a
+                // frontend that keeps one persistent canvas - windows does -
+                // would otherwise hold instrument pixels outside every region it
+                // is ever told about, and put them on screen whenever a later
+                // repaint reaches that far.
+                canvas.setClip(region);
+                defer canvas.clearClip();
+                overlay.renderMagnifier(canvas, loupe.origin, self.sample, uiScale(config));
             }
         }
     }
@@ -362,7 +382,7 @@ pub const Interaction = struct {
     }
 
     fn updateLoupe(self: *Interaction, surface: SurfaceId, physical: Point) void {
-        const scale = self.surfaces[surface].config.scale;
+        const scale = uiScale(self.surfaces[surface].config);
         sampling.fillSample(&self.sample, self.surfaces[surface].config.baseline, physical);
         const rgb = magnifier.hexAt(self.sample) orelse return;
         const origin = magnifier.windowOrigin(physical, scale);
@@ -376,7 +396,7 @@ pub const Interaction = struct {
                 return;
             }
 
-            const previous_scale = self.surfaces[previous.surface].config.scale;
+            const previous_scale = uiScale(self.surfaces[previous.surface].config);
             const old_rect = magnifier.windowRect(previous.origin, previous_scale).expand(2);
             const new_rect = magnifier.windowRect(origin, scale).expand(2);
             if (previous.surface == surface) {
@@ -394,7 +414,7 @@ pub const Interaction = struct {
 
     fn planLoupeRemoval(self: *Interaction) void {
         const loupe = self.loupe orelse return;
-        const scale = self.surfaces[loupe.surface].config.scale;
+        const scale = uiScale(self.surfaces[loupe.surface].config);
         self.appendDamage(loupe.surface, magnifier.windowRect(loupe.origin, scale).expand(2));
         self.loupe = null;
     }
@@ -410,7 +430,7 @@ pub const Interaction = struct {
 
             if (selection) |selected| {
                 if (self.cursorPhysical(index)) |cursor| {
-                    if (overlay.sizeBadge(selected, cursor, surface.config.scale, surface.config.baseline.rect())) |badge| {
+                    if (overlay.sizeBadge(selected, cursor, uiScale(surface.config), surface.config.baseline.rect())) |badge| {
                         const bounds = badge.bounds();
                         damage = damage.unionWith(bounds.expand(2));
                         surface.last_badge = bounds;

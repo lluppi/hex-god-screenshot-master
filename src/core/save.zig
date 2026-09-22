@@ -5,15 +5,103 @@
 //! saved shot is still pasteable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sys = @import("sys.zig");
+const win32 = if (builtin.os.tag == .windows) @import("../windows/win32.zig") else struct {};
+
+/// An open file created exclusively, holding no bytes yet.
+const Destination = if (builtin.os.tag == .windows) struct {
+    handle: win32.HANDLE,
+    /// The path as UTF-16, kept so the file can be deleted if the write fails
+    /// part way through. Windows deletes by name, not by descriptor.
+    wide: [:0]u16,
+} else struct {
+    descriptor: std.posix.fd_t,
+};
+
+/// Create `path`, failing with `error.PathAlreadyExists` when it is taken.
+/// `O_EXCL` on the unix side, `CREATE_NEW` on the windows one.
+fn createExclusive(allocator: std.mem.Allocator, path: [:0]const u8) !Destination {
+    if (builtin.os.tag == .windows) {
+        // WTF-8: a windows command line can carry unpaired surrogates, and the
+        // directory came from one.
+        const wide = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, path);
+        errdefer allocator.free(wide);
+        const handle = win32.CreateFileW(
+            wide.ptr,
+            win32.generic_write,
+            win32.file_share_read,
+            null,
+            win32.create_new,
+            win32.file_attribute_normal,
+            null,
+        ) orelse switch (win32.GetLastError()) {
+            win32.error_file_exists, win32.error_already_exists => return error.PathAlreadyExists,
+            win32.error_access_denied => return error.AccessDenied,
+            win32.error_path_not_found, win32.error_file_not_found => return error.FileNotFound,
+            else => return error.CreateFailed,
+        };
+        return .{ .handle = handle, .wide = wide };
+    }
+
+    return .{
+        .descriptor = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, @as(std.posix.mode_t, 0o644)),
+    };
+}
+
+fn closeDestination(allocator: std.mem.Allocator, destination: Destination) void {
+    if (builtin.os.tag == .windows) {
+        _ = win32.CloseHandle(destination.handle);
+        allocator.free(destination.wide);
+    } else {
+        sys.closeFd(destination.descriptor);
+    }
+}
+
+/// Write every byte, or an error. Unlike `sys.writeAll`, a short write to a file
+/// is worth reporting: it means the PNG on disk is not the one we captured.
+fn writeAll(destination: Destination, bytes: []const u8) !void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        if (builtin.os.tag == .windows) {
+            var written: u32 = 0;
+            if (win32.WriteFile(destination.handle, remaining.ptr, @intCast(remaining.len), &written, null) == 0) {
+                return error.WriteFailed;
+            }
+            if (written == 0) return error.WriteFailed;
+            remaining = remaining[written..];
+        } else {
+            const written = std.c.write(destination.descriptor, remaining.ptr, remaining.len);
+            if (written <= 0) return error.WriteFailed;
+            remaining = remaining[@intCast(written)..];
+        }
+    }
+}
+
+/// Close the file and delete it, so a failed write leaves nothing behind.
+fn abandon(allocator: std.mem.Allocator, destination: Destination) void {
+    if (builtin.os.tag == .windows) {
+        _ = win32.CloseHandle(destination.handle);
+        _ = win32.DeleteFileW(destination.wide.ptr);
+        allocator.free(destination.wide);
+    } else {
+        sys.closeFd(destination.descriptor);
+    }
+}
 
 /// Write `bytes` as a PNG inside `dir` and return the path that was written.
 /// The caller owns the returned path and must free it with `allocator`.
 ///
 /// The name is `hgsm-YYYYMMDD-HHMMSS-mmm.png` in UTC, so a directory listing
 /// sorts by capture order. An existing name is never overwritten: the file is
-/// opened `O_EXCL` and a `-1`, `-2`, ... suffix is tried instead, which matters
-/// because the millisecond stamp can repeat across a fast double click.
+/// opened exclusively and a `-1`, `-2`, ... suffix is tried instead, which
+/// matters because the millisecond stamp can repeat across a fast double click.
 pub fn writePng(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -30,17 +118,11 @@ pub fn writePng(
         else
             try std.fmt.bufPrint(&name_buffer, "hgsm-{s}-{d}.png", .{ stamp, suffix });
 
-        // Null terminated so the same slice can be handed to `unlinkat` if the
+        // Null terminated so the same slice can name the file to delete when the
         // write fails part way through.
         const path = try std.fs.path.joinZ(allocator, &.{ dir, name });
 
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .EXCL = true,
-            .CLOEXEC = true,
-            .NOFOLLOW = true,
-        }, @as(std.posix.mode_t, 0o644)) catch |err| switch (err) {
+        const destination = createExclusive(allocator, path) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(path);
                 continue;
@@ -51,33 +133,22 @@ pub fn writePng(
             },
         };
 
-        writeAll(fd, bytes) catch |err| {
-            sys.closeFd(fd);
+        writeAll(destination, bytes) catch |err| {
             // Do not leave a truncated PNG behind for the user to trip over.
-            _ = std.c.unlinkat(std.posix.AT.FDCWD, path.ptr, 0);
+            abandon(allocator, destination);
             allocator.free(path);
             return err;
         };
-        sys.closeFd(fd);
+        closeDestination(allocator, destination);
         return path;
     }
     return error.NameCollision;
 }
 
+
 /// The suffix budget: a millisecond stamp repeated this many times is no longer
 /// a timestamp, it is a bug.
 const max_suffix: u32 = 1000;
-
-/// Every byte, or an error. Unlike `sys.writeAll`, a short write to a file is
-/// worth reporting: it means the PNG on disk is not the one we captured.
-fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const written = std.c.write(fd, remaining.ptr, remaining.len);
-        if (written <= 0) return error.WriteFailed;
-        remaining = remaining[@intCast(written)..];
-    }
-}
 
 /// `YYYYMMDD-HHMMSS-mmm`, UTC, no trailing separator. `ms` may be zero, which is
 /// what `sys.realMs` reports when the clock is unavailable; that lands in 1970

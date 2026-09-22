@@ -22,34 +22,43 @@ EOF
 path_hint() {
 	if [[ ":$PATH:" != *":$1:"* ]]; then
 		echo "Add this to your shell config if needed:"
-		echo "  export PATH=\"$1:\$PATH\""
+		if [[ "$os" == windows ]]; then
+			echo "  set PATH=$1;%PATH%"
+		else
+			echo "  export PATH=\"$1:\$PATH\""
+		fi
 	fi
 }
 
 install() {
 	local prefix="${PREFIX:-$HOME/.local}"
+	local binary="$EXECUTABLE"
+	[[ "$os" == windows ]] && binary="$EXECUTABLE.exe"
 
 	zig build -Doptimize=ReleaseFast --prefix "$prefix"
 
-	echo "Installed: $prefix/bin/$EXECUTABLE"
+	echo "Installed: $prefix/bin/$binary"
 	echo
 	echo "Run it with:"
-	echo "  $EXECUTABLE"
+	echo "  $binary"
 	echo
 	path_hint "$prefix/bin"
 
-	if [[ "$os" == macos ]]; then
-		echo "Bind a key to $prefix/bin/$EXECUTABLE (aerospace, hammerspoon, skhd, ...)."
+	if [[ "$os" == windows ]]; then
+		echo "Bind a key to $prefix/bin/$binary (autohotkey, powertoys, ...)."
+	elif [[ "$os" == macos ]]; then
+		echo "Bind a key to $prefix/bin/$binary (aerospace, hammerspoon, skhd, ...)."
 	else
-		echo "For a compositor keybind, point it straight at $prefix/bin/$EXECUTABLE."
+		echo "For a compositor keybind, point it straight at $prefix/bin/$binary."
 	fi
 }
 
 case "$(uname -s)" in
 Darwin) os="macos" ;;
 Linux) os="linux" ;;
+MINGW* | MSYS* | CYGWIN*) os="windows" ;;
 *)
-	echo "hgsm supports linux (wayland) and macos; got $(uname -s)." >&2
+	echo "hgsm supports linux (wayland), macos and windows; got $(uname -s)." >&2
 	exit 1
 	;;
 esac
