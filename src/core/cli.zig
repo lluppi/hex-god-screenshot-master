@@ -7,7 +7,7 @@ const out = @import("out.zig");
 
 /// Single source of truth for the version: the macOS installer reads this line
 /// out of the source to fill CFBundleShortVersionString.
-pub const version = "0.2.0";
+pub const version = "0.1.0";
 
 /// Logical pixels of overlay cursor travel per unit of raw pointer delta. At 1
 /// it moves as fast as the compositor's own cursor; below 1 it is deliberately
