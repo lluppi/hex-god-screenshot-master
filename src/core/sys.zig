@@ -1,7 +1,7 @@
 //! The libc calls the frontends need outside of what `std` still exposes
 //! without dragging in the Io interface: writing to a file descriptor (stdout,
 //! or the clipboard pipe the compositor hands us), closing one, truncating one,
-//! sleeping, and a monotonic clock.
+//! and the clocks.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -13,7 +13,6 @@ const TimeSpec = extern struct {
 
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buffer: [*]const u8, count: usize) isize;
-extern "c" fn nanosleep(request: *const TimeSpec, remaining: ?*TimeSpec) c_int;
 extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
 extern "c" fn clock_gettime(clock_id: c_int, result: *TimeSpec) c_int;
 
@@ -39,14 +38,6 @@ pub fn writeAll(fd: c_int, bytes: []const u8) void {
 
 pub fn closeFd(fd: c_int) void {
     _ = close(fd);
-}
-
-pub fn sleepMs(milliseconds: u64) void {
-    const request = TimeSpec{
-        .tv_sec = @intCast(milliseconds / 1000),
-        .tv_nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
-    };
-    _ = nanosleep(&request, null);
 }
 
 pub fn truncateFd(fd: c_int, length: u64) !void {

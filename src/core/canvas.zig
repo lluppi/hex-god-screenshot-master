@@ -1,4 +1,4 @@
-//! The drawing surface both frontends render into. Premultiplied ARGB8888,
+//! The drawing surface every frontend renders into. Premultiplied ARGB8888,
 //! top-left origin, one `u32` per pixel.
 
 const std = @import("std");

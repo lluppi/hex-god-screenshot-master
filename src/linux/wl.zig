@@ -44,7 +44,6 @@ pub extern fn wl_display_dispatch_pending(display: *Obj) c_int;
 pub extern fn wl_display_roundtrip(display: *Obj) c_int;
 pub extern fn wl_display_flush(display: *Obj) c_int;
 pub extern fn wl_display_get_fd(display: *Obj) c_int;
-pub extern fn wl_display_get_registry(display: *Obj) ?*Obj;
 pub extern fn wl_proxy_get_version(proxy: *Obj) u32;
 pub extern fn wl_proxy_add_listener(
     proxy: *Obj,
@@ -105,10 +104,10 @@ pub const anchor_left: u32 = 4;
 
 pub const keyboard_interactivity_exclusive: u32 = 1;
 
-/// `zwp_pointer_constraints_v1.lifetime`. A oneshot constraint is defunct the
-/// moment it deactivates, which is exactly what happens whenever the pointer
-/// focus moves; the fine cursor has to survive that, so it asks for persistent.
-pub const constraint_lifetime_oneshot: u32 = 1;
+/// `zwp_pointer_constraints_v1.lifetime`. A oneshot constraint (1) is defunct
+/// the moment it deactivates, which is exactly what happens whenever the
+/// pointer focus moves; the fine cursor has to survive that, so it asks for
+/// persistent.
 pub const constraint_lifetime_persistent: u32 = 2;
 
 pub fn fixedToFloat(value: i32) f64 {
@@ -446,10 +445,6 @@ pub fn relativePointerManagerGetRelativePointer(
     return requestNew(manager, 1, &zwp_relative_pointer_v1_interface, version, &args);
 }
 
-pub fn relativePointerDestroy(relative_pointer: *Obj) void {
-    requestDestroy(relative_pointer, 0, &no_args);
-}
-
 /// `zwp_pointer_constraints_v1.lock_pointer`: pin the real pointer. `region`
 /// stays null, which the protocol reads as the whole surface.
 pub fn constraintsLockPointer(
@@ -513,7 +508,6 @@ pub fn noop(
 /// xkbcommon bindings, used only to turn the Escape keycode into a decision.
 pub const xkb = struct {
     pub extern fn xkb_context_new(flags: u32) ?*anyopaque;
-    pub extern fn xkb_context_unref(context: *anyopaque) void;
     pub extern fn xkb_keymap_new_from_string(
         context: *anyopaque,
         string: [*:0]const u8,

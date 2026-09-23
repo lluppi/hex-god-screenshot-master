@@ -144,10 +144,6 @@ pub const CGDataProviderRef = *anyopaque;
 pub const CFDataRef = *anyopaque;
 
 pub extern "c" fn CGDisplayCreateImage(display: CGDirectDisplayID) ?CGImageRef;
-pub extern "c" fn CGDisplayCreateImageForRect(
-    display: CGDirectDisplayID,
-    rect: CGRect,
-) ?CGImageRef;
 pub extern "c" fn CGImageGetWidth(image: CGImageRef) usize;
 pub extern "c" fn CGImageGetHeight(image: CGImageRef) usize;
 pub extern "c" fn CGImageGetBitsPerPixel(image: CGImageRef) usize;

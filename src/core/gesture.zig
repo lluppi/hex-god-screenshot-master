@@ -1,5 +1,5 @@
 //! The one gesture, state-machine half. Port of the original Swift
-//! `SelectionCoordinator` so both frontends resolve a gesture identically:
+//! `SelectionCoordinator` so every frontend resolves a gesture identically:
 //!
 //!  * hover  -> live loupe at the cursor
 //!  * click  -> copy the pixel's hex (release closer than `click_threshold`)

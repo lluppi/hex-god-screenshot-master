@@ -1,4 +1,4 @@
-//! Compositor for the full-screen selection overlay, shared by both frontends.
+//! Compositor for the full-screen selection overlay, shared by every frontend.
 //!
 //! The frontends hand us a `baseline`: a snapshot of the whole screen in
 //! physical pixels, taken the moment the overlay appeared. Everything the

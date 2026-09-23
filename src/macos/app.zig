@@ -20,10 +20,8 @@ const std = @import("std");
 const objc = @import("objc.zig");
 const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
-const color = @import("../core/color.zig");
+const deliver = @import("../core/deliver.zig");
 const interaction_mod = @import("../core/interaction.zig");
-const png = @import("../core/png.zig");
-const save = @import("../core/save.zig");
 const cli = @import("../core/cli.zig");
 const out = @import("../core/out.zig");
 
@@ -73,7 +71,6 @@ const App = struct {
     /// PNG. Null means clipboard only, which is the default.
     save_dir: ?[]const u8 = null,
     pointer_detached: bool = false,
-    finished: bool = false,
     exit_code: u8 = 0,
 };
 
@@ -148,16 +145,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                 out.fail("no display contains {d},{d}\n", .{ point.x, point.y });
                 std.process.exit(1);
             };
-            const hex = color.hexString(rgb);
-            out.print("{s}\n", .{hex});
-            copyText(&hex);
+            app.exit_code = deliver.colour(rgb, &app, copyText);
         },
         .shot => |rect| {
-            const canvas = try captureScreenshot(&app, rect);
-            const bytes = try png.encode(allocator, canvas);
-            saveScreenshot(&app, bytes);
-            out.print("Screenshot copied to clipboard\n", .{});
-            copyPng(bytes);
+            app.exit_code = deliver.screenshot(allocator, app.surfaces, rect, app.save_dir, &app, copyPng);
         },
         .interactive => {
             switch (dev) {
@@ -551,15 +542,12 @@ fn endSelection(app: *App) void {
 }
 
 fn cancel(app: *App) void {
-    if (app.finished or !app.interaction.?.cancel()) return;
-    app.finished = true;
+    if (!app.interaction.?.cancel()) return;
     releasePointer(app);
-    terminate();
+    terminate(app);
 }
 
 fn finish(app: *App, result: interaction_mod.Result) void {
-    if (app.finished) return;
-    app.finished = true;
     // Restore the system pointer before dismissing the overlay.
     releasePointer(app);
 
@@ -568,93 +556,24 @@ fn finish(app: *App, result: interaction_mod.Result) void {
             const rgb = interaction_mod.colorAt(app.surfaces, point) orelse {
                 out.fail("the pixel colour could not be read\n", .{});
                 app.exit_code = 1;
-                terminate();
-                return;
+                terminate(app);
             };
-            const hex = color.hexString(rgb);
-            out.print("{s}\n", .{hex});
             hideOverlays(app);
-            copyText(&hex);
+            app.exit_code = deliver.colour(rgb, app, copyText);
         },
         .screenshot => |rect| {
             hideOverlays(app);
-            var canvas = captureScreenshot(app, rect) catch |err| {
-                out.fail("screenshot failed: {t}\n", .{err});
-                app.exit_code = 1;
-                terminate();
-                return;
-            };
-            defer canvas.deinit();
-            const bytes = png.encode(app.allocator, canvas) catch |err| {
-                out.fail("png encoding failed: {t}\n", .{err});
-                app.exit_code = 1;
-                terminate();
-                return;
-            };
-            saveScreenshot(app, bytes);
-            out.print("Screenshot copied to clipboard\n", .{});
-            copyPng(bytes);
+            app.exit_code = deliver.screenshot(app.allocator, app.surfaces, rect, app.save_dir, app, copyPng);
         },
     }
-    terminate();
+    terminate(app);
 }
 
-/// Write the PNG into `--save-dir` if one was given, the same as the linux
-/// frontend. The clipboard copy is unaffected: a failed save is reported and
-/// reflected in the exit code, but it does not stop the paste from working.
-fn saveScreenshot(app: *App, bytes: []const u8) void {
-    const dir = app.save_dir orelse return;
-    const path = save.writePng(app.allocator, dir, bytes) catch |err| {
-        out.fail("could not save screenshot to {s}: {t}\n", .{ dir, err });
-        app.exit_code = 1;
-        return;
-    };
-    defer app.allocator.free(path);
-    out.print("Screenshot saved to {s}\n", .{path});
-}
-
-fn terminate() void {
-    const application = objc.msgSend(id, objc.class("NSApplication"), objc.sel("sharedApplication"), .{});
-    objc.msgSend(void, application, objc.sel("terminate:"), .{@as(id, null)});
-}
-
-/// Capture a global logical rectangle. The composition and the single-display
-/// shortcut both live in the shared interaction; this only supplies the
-/// per-display capture.
-fn captureScreenshot(app: *App, rect: FRect) !Canvas {
-    return interaction_mod.captureScreenshot(app.allocator, app.surfaces, rect, app, captureOne);
-}
-
-/// Crop one display's share from the baseline already shown under the overlay.
-/// This is both WYSIWYG and avoids another WindowServer capture after dragging.
-fn captureOne(app: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
-    const display = app.displays.items[surface];
-    const baseline = display.baseline.?;
-    const source = Rect.roundF(.{
-        .x = (intersection.x - display.logical.x) * display.scale,
-        .y = (intersection.y - display.logical.y) * display.scale,
-        .w = intersection.w * display.scale,
-        .h = intersection.h * display.scale,
-    }).clamped(baseline.width, baseline.height);
-    if (source.isEmpty()) return error.EmptyCapture;
-
-    var captured = try Canvas.initUninitialized(
-        app.allocator,
-        @intCast(source.w),
-        @intCast(source.h),
-    );
-    errdefer captured.deinit();
-    var row: i32 = 0;
-    while (row < source.h) : (row += 1) {
-        const source_start = baseline.index(source.x, source.y + row);
-        const captured_start = captured.index(0, row);
-        const width: usize = @intCast(source.w);
-        @memcpy(
-            captured.pixels[captured_start .. captured_start + width],
-            baseline.pixels[source_start .. source_start + width],
-        );
-    }
-    return captured;
+/// End the process from inside the AppKit run loop. `-[NSApplication
+/// terminate:]` would do the same but always exits with status 0, dropping the
+/// exit code a failed copy or save set.
+fn terminate(app: *App) noreturn {
+    std.process.exit(app.exit_code);
 }
 
 fn updateHoverFromMouse(app: *App) ?Point {
@@ -678,36 +597,21 @@ fn nsString(bytes: []const u8) id {
     });
 }
 
-fn pasteboard() id {
-    return objc.msgSend(id, objc.class("NSPasteboard"), objc.sel("generalPasteboard"), .{});
+fn copyText(_: *App, text: []const u8) !void {
+    try setPasteboard("setString:forType:", nsString(text), "public.utf8-plain-text");
 }
 
-fn copyText(text: []const u8) void {
-    const board = pasteboard();
-    _ = objc.msgSend(objc.NSInteger, board, objc.sel("clearContents"), .{});
-    const pasteboard_type = objc.msgSend(
-        id,
-        objc.class("NSString"),
-        objc.sel("stringWithUTF8String:"),
-        .{@as([*:0]const u8, "public.utf8-plain-text")},
-    );
-    _ = objc.msgSend(bool, board, objc.sel("setString:forType:"), .{ nsString(text), pasteboard_type });
+fn copyPng(_: *App, _: Canvas, bytes: []const u8) !void {
+    const data = objc.msgSend(id, objc.class("NSData"), objc.sel("dataWithBytes:length:"), .{ bytes.ptr, bytes.len });
+    try setPasteboard("setData:forType:", data, "public.png");
 }
 
-fn copyPng(bytes: []const u8) void {
-    const board = pasteboard();
+/// Replace the general pasteboard's contents with `value` as `pasteboard_type`.
+fn setPasteboard(comptime setter: [*:0]const u8, value: id, pasteboard_type: [*:0]const u8) !void {
+    const board = objc.msgSend(id, objc.class("NSPasteboard"), objc.sel("generalPasteboard"), .{});
     _ = objc.msgSend(objc.NSInteger, board, objc.sel("clearContents"), .{});
-    const data = objc.msgSend(id, objc.class("NSData"), objc.sel("dataWithBytes:length:"), .{
-        bytes.ptr,
-        bytes.len,
-    });
-    const pasteboard_type = objc.msgSend(
-        id,
-        objc.class("NSString"),
-        objc.sel("stringWithUTF8String:"),
-        .{@as([*:0]const u8, "public.png")},
-    );
-    _ = objc.msgSend(bool, board, objc.sel("setData:forType:"), .{ data, pasteboard_type });
+    const type_string = objc.msgSend(id, objc.class("NSString"), objc.sel("stringWithUTF8String:"), .{pasteboard_type});
+    if (!objc.msgSend(bool, board, objc.sel(setter), .{ value, type_string })) return error.PasteboardRejected;
 }
 
 // ---------------------------------------------------------------------------

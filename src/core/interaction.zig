@@ -1,7 +1,7 @@
 //! Platform-independent interaction state for the screenshot overlay.
 //!
 //! Frontends translate native events into surface-local cursor movement, apply
-//! the returned physical-pixel damage, and own capture/clipboard operations.
+//! the returned physical-pixel damage, and own the clipboard.
 
 const std = @import("std");
 const canvas_mod = @import("canvas.zig");
@@ -86,19 +86,15 @@ pub fn paintDamages(damages: []const Damage, ctx: *anyopaque, paint: PaintFn) vo
     for (damages) |damage| paint(ctx, damage.surface, damage.rect);
 }
 
-/// Capture a global logical rectangle into one canvas.
+/// Capture a global logical rectangle into one canvas, cropped from the
+/// baselines already shown under the overlay. That is both WYSIWYG and avoids
+/// another screen capture after the gesture.
 ///
 /// The common case - the rectangle on a single surface - returns that surface's
-/// capture untouched, so the pixels stay exactly as the platform produced them.
+/// crop untouched, so the pixels stay exactly as the platform produced them.
 /// Only a rectangle spanning surfaces is composited, into the highest scale in
-/// play. `capture` returns one surface's share, in global logical coordinates.
-pub fn captureScreenshot(
-    allocator: std.mem.Allocator,
-    surfaces: []const Surface,
-    rect: FRect,
-    ctx: anytype,
-    comptime capture: fn (@TypeOf(ctx), SurfaceId, FRect) anyerror!Canvas,
-) !Canvas {
+/// play.
+pub fn captureScreenshot(allocator: std.mem.Allocator, surfaces: []const Surface, rect: FRect) !Canvas {
     var single: ?SurfaceId = null;
     var count: usize = 0;
     for (surfaces, 0..) |surface, index| {
@@ -108,7 +104,7 @@ pub fn captureScreenshot(
     }
     if (count == 1) {
         const id = single.?;
-        return capture(ctx, id, rect.intersection(surfaces[id].logical));
+        return cropBaseline(allocator, surfaces[id], rect.intersection(surfaces[id].logical));
     }
 
     var scale: f64 = 1;
@@ -119,10 +115,10 @@ pub fn captureScreenshot(
     var composite = try Canvas.init(allocator, width, height);
     errdefer composite.deinit();
 
-    for (surfaces, 0..) |surface, index| {
+    for (surfaces) |surface| {
         const intersection = rect.intersection(surface.logical);
         if (intersection.isEmpty()) continue;
-        var captured = try capture(ctx, index, intersection);
+        var captured = try cropBaseline(allocator, surface, intersection);
         defer captured.deinit();
 
         const destination = Rect.roundF(.{
@@ -134,6 +130,32 @@ pub fn captureScreenshot(
         composite.blitNearest(captured, captured.rect(), destination);
     }
     return composite;
+}
+
+/// Copy one surface's share of a global logical rectangle out of its baseline.
+fn cropBaseline(allocator: std.mem.Allocator, surface: Surface, intersection: FRect) !Canvas {
+    const baseline = surface.baseline;
+    const source = Rect.roundF(.{
+        .x = (intersection.x - surface.logical.x) * surface.scale,
+        .y = (intersection.y - surface.logical.y) * surface.scale,
+        .w = intersection.w * surface.scale,
+        .h = intersection.h * surface.scale,
+    }).clamped(baseline.width, baseline.height);
+    if (source.isEmpty()) return error.EmptyCapture;
+
+    var captured = try Canvas.initUninitialized(allocator, @intCast(source.w), @intCast(source.h));
+    errdefer captured.deinit();
+    const width: usize = @intCast(source.w);
+    var row: i32 = 0;
+    while (row < source.h) : (row += 1) {
+        const source_start = baseline.index(source.x, source.y + row);
+        const captured_start = captured.index(0, row);
+        @memcpy(
+            captured.pixels[captured_start .. captured_start + width],
+            baseline.pixels[source_start .. source_start + width],
+        );
+    }
+    return captured;
 }
 
 const Cursor = struct {

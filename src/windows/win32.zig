@@ -217,8 +217,6 @@ pub const mouse_virtual_desktop: u16 = 0x02;
 pub const attach_parent_process: DWORD = 0xFFFF_FFFF;
 pub const open_existing: DWORD = 3;
 
-/// GetDpiForMonitor's first argument; the effective (scaled) DPI, not the
-/// hardware one, is what the overlay has to size itself against.
 pub const invalid_handle_value: HANDLE = @ptrFromInt(std.math.maxInt(usize));
 pub const std_output_handle: DWORD = 0xFFFF_FFF5;
 pub const std_error_handle: DWORD = 0xFFFF_FFF4;
@@ -367,7 +365,7 @@ pub extern "user32" fn GetStdHandle(which: DWORD) callconv(.winapi) ?HANDLE;
 
 pub extern "gdi32" fn GetDeviceCaps(dc: HDC, index: i32) callconv(.winapi) i32;
 /// "Flushes the calling thread's current batch" - i.e. waits until pending GDI
-/// drawing has actually touched the destination. See `paintDisplayRegion`:
+/// drawing has actually touched the destination. See `presentDisplay`:
 /// without this, a blit out of the canvas can still be reading it while the next
 /// frame's compose writes over it.
 pub extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
@@ -452,7 +450,6 @@ pub fn systemDpi() UINT {
 
 pub extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GetProcAddress(module: HINSTANCE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-pub extern "kernel32" fn FreeLibrary(module: HINSTANCE) callconv(.winapi) BOOL;
 
 pub const GetDpiForMonitorFn = *const fn (monitor: HANDLE, kind: i32, x: *UINT, y: *UINT) callconv(.winapi) i32;
 

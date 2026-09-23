@@ -43,12 +43,6 @@ pub fn rgbOf(pixel: u32) Rgb {
     };
 }
 
-/// Black at the given opacity, premultiplied (the only translucent colour the
-/// badges need).
-pub fn black(alpha: u8) u32 {
-    return @as(u32, alpha) << 24;
-}
-
 /// Scale a premultiplied pixel's alpha (and therefore its components) by a
 /// coverage fraction, for anti-aliased edges. Premultiplied means this needs no
 /// unpremultiply/repremultiply round trip: every channel, alpha included, is

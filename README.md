@@ -42,7 +42,7 @@ hyprland provide. gnome and kde wayland do not - says so and exits
 
 this installs a bare command-line binary rather than an app bundle. macos screen
 recording permissions are associated with the terminal or window manager that
-launches `hgsm.; grant access to that launcher if macos prompts for it
+launches `hgsm`; grant access to that launcher if macos prompts for it
 
 bind it in your window manager, for example aerospace:
 
@@ -72,6 +72,7 @@ hgsm --gain N       # overlay cursor speed (default 0.5)
 hgsm --no-fine      # let the compositor's cursor drive the overlay
 hgsm --info         # outputs/displays, their scales, the fine pointer protocols
 hgsm --version      # the version
+hgsm --help         # all of the above
 ```
 
 the overlay and resulting screenshot use the desktop captured when `hgsm` starts,

@@ -47,10 +47,8 @@ const std = @import("std");
 const win32 = @import("win32.zig");
 const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
-const color = @import("../core/color.zig");
+const deliver = @import("../core/deliver.zig");
 const interaction_mod = @import("../core/interaction.zig");
-const png = @import("../core/png.zig");
-const save = @import("../core/save.zig");
 const cli = @import("../core/cli.zig");
 const out = @import("../core/out.zig");
 
@@ -184,18 +182,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                 out.fail("no monitor contains {d},{d}\n", .{ point.x, point.y });
                 std.process.exit(1);
             };
-            const hex = color.hexString(rgb);
-            out.print("{s}\n", .{hex});
-            copyText(&hex);
+            app.exit_code = deliver.colour(rgb, &app, copyText);
         },
         .shot => |rect| {
-            var canvas = try captureScreenshot(&app, rect);
-            defer canvas.deinit();
-            const bytes = try png.encode(allocator, canvas);
-            defer allocator.free(bytes);
-            saveScreenshot(&app, bytes);
-            out.print("Screenshot copied to clipboard\n", .{});
-            copyScreenshot(canvas, bytes);
+            app.exit_code = deliver.screenshot(allocator, app.surfaces, rect, app.save_dir, &app, copyScreenshot);
         },
         .interactive => {
             switch (dev) {
@@ -457,45 +447,6 @@ fn bitmapInfo(width: i32, height: i32) win32.BITMAPINFO {
     };
 }
 
-/// Capture a global logical rectangle. The composition and the single-monitor
-/// shortcut both live in the shared interaction; this only supplies the
-/// per-monitor capture.
-fn captureScreenshot(app: *App, rect: FRect) !Canvas {
-    return interaction_mod.captureScreenshot(app.allocator, app.surfaces, rect, app, captureOne);
-}
-
-/// Crop one monitor's share from the baseline already shown under the overlay.
-/// This is both WYSIWYG and avoids another screen capture after dragging.
-fn captureOne(app: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
-    const display = app.displays.items[surface];
-    const baseline = display.baseline.?;
-    const source = Rect.roundF(.{
-        .x = (intersection.x - display.logical.x) * app.scale,
-        .y = (intersection.y - display.logical.y) * app.scale,
-        .w = intersection.w * app.scale,
-        .h = intersection.h * app.scale,
-    }).clamped(baseline.width, baseline.height);
-    if (source.isEmpty()) return error.EmptyCapture;
-
-    var captured = try Canvas.initUninitialized(
-        app.allocator,
-        @intCast(source.w),
-        @intCast(source.h),
-    );
-    errdefer captured.deinit();
-    var row: i32 = 0;
-    while (row < source.h) : (row += 1) {
-        const source_start = baseline.index(source.x, source.y + row);
-        const captured_start = captured.index(0, row);
-        const width: usize = @intCast(source.w);
-        @memcpy(
-            captured.pixels[captured_start .. captured_start + width],
-            baseline.pixels[source_start .. source_start + width],
-        );
-    }
-    return captured;
-}
-
 // ---------------------------------------------------------------------------
 // Overlay
 // ---------------------------------------------------------------------------
@@ -509,6 +460,12 @@ fn runOverlay(app: *App) !void {
         app.interaction = null;
     }
 
+    // Deferred before the first window exists, so a failure part way through
+    // creating them still destroys the ones already made.
+    defer for (app.displays.items) |display| {
+        if (display.hwnd) |hwnd| _ = win32.DestroyWindow(hwnd);
+        display.hwnd = null;
+    };
     for (app.displays.items) |display| try createWindow(app, display);
 
     // Seed the loupe before presenting any window, then show them, take the
@@ -516,8 +473,7 @@ fn runOverlay(app: *App) !void {
     const initial_cursor = updateHoverFromMouse(app);
     showOverlays(app);
     hideCursor();
-    var cursor_hidden = true;
-    defer if (cursor_hidden) showCursor();
+    defer showCursor();
     defer releasePointer(app);
 
     if (initial_cursor) |global| {
@@ -548,15 +504,6 @@ fn runOverlay(app: *App) !void {
         }
         _ = win32.MsgWaitForMultipleObjectsEx(0, null, 8, win32.qs_allinput, win32.mwmo_inputavailable);
     }
-
-    for (app.displays.items) |display| {
-        if (display.hwnd) |hwnd| {
-            _ = win32.DestroyWindow(hwnd);
-            display.hwnd = null;
-        }
-    }
-    showCursor();
-    cursor_hidden = false;
 }
 
 fn registerClass() bool {
@@ -769,10 +716,12 @@ fn presentDisplay(display: *Display) void {
         .prcDirty = &rect,
     };
     if (win32.UpdateLayeredWindowIndirect(hwnd, &info) == 0) {
-        std.debug.print("UpdateLayeredWindowIndirect failed: {d}\n", .{win32.GetLastError()});
-        // Keep the whole frame dirty so a later present can retry rather than
-        // silently treating a frame Windows never accepted as current.
-        display.dirty = canvas.rect();
+        // An overlay that cannot be shown cannot be used; retrying every frame
+        // would only spin. Give up the way a cancel does, but say why.
+        out.fail("could not draw the overlay (UpdateLayeredWindowIndirect error {d})\n", .{win32.GetLastError()});
+        const app = current_app orelse return;
+        app.exit_code = 1;
+        terminate(app);
     }
 }
 
@@ -876,47 +825,15 @@ fn finish(app: *App, result: interaction_mod.Result) void {
                 terminate(app);
                 return;
             };
-            const hex = color.hexString(rgb);
-            out.print("{s}\n", .{hex});
             hideOverlays(app);
-            copyText(&hex);
+            app.exit_code = deliver.colour(rgb, app, copyText);
         },
         .screenshot => |rect| {
             hideOverlays(app);
-            var canvas = captureScreenshot(app, rect) catch |err| {
-                out.fail("screenshot failed: {t}\n", .{err});
-                app.exit_code = 1;
-                terminate(app);
-                return;
-            };
-            defer canvas.deinit();
-            const bytes = png.encode(app.allocator, canvas) catch |err| {
-                out.fail("png encoding failed: {t}\n", .{err});
-                app.exit_code = 1;
-                terminate(app);
-                return;
-            };
-            defer app.allocator.free(bytes);
-            saveScreenshot(app, bytes);
-            out.print("Screenshot copied to clipboard\n", .{});
-            copyScreenshot(canvas, bytes);
+            app.exit_code = deliver.screenshot(app.allocator, app.surfaces, rect, app.save_dir, app, copyScreenshot);
         },
     }
     terminate(app);
-}
-
-/// Write the PNG into `--save-dir` if one was given, the same as the other
-/// frontends. The clipboard copy is unaffected: a failed save is reported and
-/// reflected in the exit code, but it does not stop the paste from working.
-fn saveScreenshot(app: *App, bytes: []const u8) void {
-    const dir = app.save_dir orelse return;
-    const path = save.writePng(app.allocator, dir, bytes) catch |err| {
-        out.fail("could not save screenshot to {s}: {t}\n", .{ dir, err });
-        app.exit_code = 1;
-        return;
-    };
-    defer app.allocator.free(path);
-    out.print("Screenshot saved to {s}\n", .{path});
 }
 
 fn terminate(app: *App) void {
@@ -1143,31 +1060,41 @@ fn updateHoverFromMouse(app: *App) ?Point {
 // Clipboard
 // ---------------------------------------------------------------------------
 
-fn copyText(text: []const u8) void {
-    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, text) catch return;
-    defer std.heap.page_allocator.free(wide);
+fn copyText(app: *App, text: []const u8) !void {
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(app.allocator, text);
+    defer app.allocator.free(wide);
 
-    const owner = openClipboard() orelse return;
+    const owner = try openClipboard();
     defer closeClipboard(owner);
-    if (win32.EmptyClipboard() == 0) return;
-
-    const memory = wideMemory(wide) orelse return;
-    // Ownership passes to the clipboard on success; freeing the block here would
-    // leave the paste with nothing to read.
-    if (win32.SetClipboardData(win32.cf_unicode_text, memory) == null) _ = win32.GlobalFree(memory);
+    try setClipboard(win32.cf_unicode_text, std.mem.sliceAsBytes(wide[0 .. wide.len + 1]));
 }
 
-/// The clipboard has a single owner at a time and other software holds it
-/// constantly - a clipboard manager, a launcher, Parallels' own sharing agent -
-/// so `OpenClipboard` failing is routine rather than exceptional. This tool
-/// exists to put one thing on the clipboard; it is worth waiting for it.
+/// Publish a screenshot as both a DIB (what paint, word, explorer and most
+/// apps ask for) and the registered `PNG` format (what browsers, chat clients
+/// and image editors ask for, and the only one that survives transparency and
+/// exact bytes). One clipboard generation, two formats.
+fn copyScreenshot(app: *App, canvas: Canvas, png_bytes: []const u8) !void {
+    const dib = try dibBytes(app.allocator, canvas);
+    defer app.allocator.free(dib);
+
+    const owner = try openClipboard();
+    defer closeClipboard(owner);
+    try setClipboard(win32.cf_dib, dib);
+    try setClipboard(win32.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("PNG")), png_bytes);
+}
+
+/// Open and empty the clipboard.
 ///
 /// The clipboard must be opened against a real window: with a null owner,
 /// `EmptyClipboard` leaves the clipboard ownerless and every following
 /// `SetClipboardData` fails. The overlays may already be hidden or never exist
-/// (the `pick`/`shot` commands), so a throwaway message-only window is used as
-/// the owner. Data set without delayed rendering outlives that window.
-fn openClipboard() ?win32.HWND {
+/// (`--pick`/`--shot`), so a throwaway message-only window is the owner. Data
+/// set without delayed rendering outlives that window.
+///
+/// Other software holds the clipboard constantly - a clipboard manager, a
+/// launcher, Parallels' own sharing agent - so `OpenClipboard` failing is
+/// routine and worth retrying for a moment.
+fn openClipboard() !win32.HWND {
     const owner = win32.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
@@ -1181,15 +1108,17 @@ fn openClipboard() ?win32.HWND {
         null,
         win32.GetModuleHandleW(null),
         null,
-    ) orelse return null;
+    ) orelse return error.WindowFailed;
 
-    var attempt: u8 = 0;
-    while (attempt < clipboard_attempts) : (attempt += 1) {
-        if (win32.OpenClipboard(owner) != 0) return owner;
+    for (0..clipboard_attempts) |_| {
+        if (win32.OpenClipboard(owner) != 0) {
+            _ = win32.EmptyClipboard();
+            return owner;
+        }
         win32.Sleep(clipboard_retry_ms);
     }
     _ = win32.DestroyWindow(owner);
-    return null;
+    return error.ClipboardBusy;
 }
 
 fn closeClipboard(owner: win32.HWND) void {
@@ -1197,84 +1126,36 @@ fn closeClipboard(owner: win32.HWND) void {
     _ = win32.DestroyWindow(owner);
 }
 
-const clipboard_attempts: u8 = 20;
+const clipboard_attempts = 20;
 const clipboard_retry_ms: u32 = 10;
 
-/// A `GMEM_MOVEABLE` block holding `wide`, terminator included, already locked
-/// and unlocked again. Null when the allocation fails.
-fn wideMemory(wide: [:0]const u16) ?win32.HGLOBAL {
-    const bytes = (wide.len + 1) * @sizeOf(u16);
-    const memory = win32.GlobalAlloc(win32.gmem_moveable, bytes) orelse return null;
-    const destination = win32.GlobalLock(memory) orelse {
-        _ = win32.GlobalFree(memory);
-        return null;
-    };
-    @memcpy(@as([*]u8, @ptrCast(destination))[0..bytes], std.mem.sliceAsBytes(wide[0 .. wide.len + 1]));
+/// Put a copy of `bytes` on the open clipboard as `format`.
+fn setClipboard(format: win32.UINT, bytes: []const u8) !void {
+    const memory = win32.GlobalAlloc(win32.gmem_moveable, bytes.len) orelse return error.OutOfMemory;
+    @memcpy(@as([*]u8, @ptrCast(win32.GlobalLock(memory).?))[0..bytes.len], bytes);
     _ = win32.GlobalUnlock(memory);
-    return memory;
-}
-
-/// Publish a screenshot as both a DIB (what paint, word, explorer and most
-/// apps ask for) and the registered `PNG` format (what browsers, chat clients
-/// and image editors ask for, and the only one that survives transparency and
-/// exact bytes). One clipboard generation, two formats.
-fn copyScreenshot(canvas: Canvas, png_bytes: []const u8) void {
-    const owner = openClipboard() orelse return;
-    defer closeClipboard(owner);
-    if (win32.EmptyClipboard() == 0) return;
-
-    if (dibMemory(canvas)) |memory| {
-        if (win32.SetClipboardData(win32.cf_dib, memory) == null) _ = win32.GlobalFree(memory);
-    }
-
-    const format = win32.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("PNG"));
-    if (format != 0) {
-        if (blobMemory(png_bytes)) |memory| {
-            if (win32.SetClipboardData(format, memory) == null) _ = win32.GlobalFree(memory);
-        }
+    // Ownership passes to the clipboard on success; on failure it is still ours.
+    if (win32.SetClipboardData(format, memory) == null) {
+        _ = win32.GlobalFree(memory);
+        return error.ClipboardRejected;
     }
 }
 
 /// A bottom-up 32bpp BI_RGB bitmap: a `BITMAPINFOHEADER` followed by the rows,
-/// last row first. Alpha is dropped rather than clipped, because that is what
-/// 32bpp BI_RGB means and the screen is opaque anyway.
-fn dibMemory(canvas: Canvas) ?win32.HGLOBAL {
+/// last row first. The alpha byte comes along, and BI_RGB ignores it.
+fn dibBytes(allocator: std.mem.Allocator, canvas: Canvas) ![]u8 {
     const width: usize = canvas.width;
     const height: usize = canvas.height;
-    if (width == 0 or height == 0) return null;
-
-    const header_bytes = @sizeOf(win32.BITMAPINFOHEADER);
-    const pixels_bytes = width * height * 4;
-    const memory = win32.GlobalAlloc(win32.gmem_moveable, header_bytes + pixels_bytes) orelse return null;
-    const block = win32.GlobalLock(memory) orelse {
-        _ = win32.GlobalFree(memory);
-        return null;
-    };
-
-    const header: *win32.BITMAPINFOHEADER = @ptrCast(@alignCast(block));
-    header.* = bitmapInfo(@intCast(width), @intCast(height)).bmiHeader;
+    var header = bitmapInfo(@intCast(width), @intCast(height)).bmiHeader;
     header.biHeight = @intCast(height);
 
-    const bytes: [*]u8 = @ptrCast(block);
-    const pixels: [*]u32 = @ptrCast(@alignCast(bytes + header_bytes));
-    var row: usize = 0;
-    while (row < height) : (row += 1) {
-        const source = canvas.pixels[(height - 1 - row) * width ..][0..width];
-        @memcpy(pixels[row * width ..][0..width], source);
+    const header_bytes = std.mem.asBytes(&header);
+    const row_bytes = width * 4;
+    const bytes = try allocator.alloc(u8, header_bytes.len + height * row_bytes);
+    @memcpy(bytes[0..header_bytes.len], header_bytes);
+    const pixels = std.mem.sliceAsBytes(canvas.pixels);
+    for (0..height) |row| {
+        @memcpy(bytes[header_bytes.len + row * row_bytes ..][0..row_bytes], pixels[(height - 1 - row) * row_bytes ..][0..row_bytes]);
     }
-
-    _ = win32.GlobalUnlock(memory);
-    return memory;
-}
-
-/// A `GMEM_MOVEABLE` block holding `bytes`, already locked and unlocked again.
-fn blobMemory(bytes: []const u8) ?win32.HGLOBAL {
-    const memory = win32.GlobalAlloc(win32.gmem_moveable, bytes.len) orelse return null;
-    const block = win32.GlobalLock(memory) orelse {
-        _ = win32.GlobalFree(memory);
-        return null;
-    };
-    @memcpy(@as([*]u8, @ptrCast(block))[0..bytes.len], bytes);
-    _ = win32.GlobalUnlock(memory);
-    return memory;
+    return bytes;
 }

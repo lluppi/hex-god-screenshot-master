@@ -1,5 +1,5 @@
 //! Reading the baseline capture: the pixel under the cursor, and the
-//! neighbourhood the loupe magnifies. Shared by both frontends because both
+//! neighbourhood the loupe magnifies. Shared by every frontend because they all
 //! keep a frozen baseline of each display and never capture live pixels for the
 //! loupe.
 

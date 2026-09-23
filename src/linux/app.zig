@@ -18,10 +18,8 @@ const shm_mod = @import("shm.zig");
 const capture = @import("capture.zig");
 const geom = @import("../core/geom.zig");
 const canvas_mod = @import("../core/canvas.zig");
-const color_mod = @import("../core/color.zig");
+const deliver = @import("../core/deliver.zig");
 const interaction_mod = @import("../core/interaction.zig");
-const png = @import("../core/png.zig");
-const save = @import("../core/save.zig");
 const out = @import("../core/out.zig");
 const cli = @import("../core/cli.zig");
 const sys = @import("../core/sys.zig");
@@ -41,9 +39,8 @@ const evdev_escape: u32 = 1;
 const evdev_shift_l: u32 = 42;
 const evdev_shift_r: u32 = 54;
 
-/// Synthetic gestures for development: they drive the very same functions the
-/// pointer handlers call, so a click or a drag can be exercised (and screenshoted
-/// mid selection) without a mouse or an input injector on the box.
+/// How long an unpasted selection is served, and how long the process lingers
+/// after its last paste in case another one follows.
 const clipboard_timeout_ms: i64 = 60_000;
 const clipboard_idle_after_send_ms: i64 = 5_000;
 
@@ -258,17 +255,10 @@ pub fn run(minimal: std.process.Init.Minimal) !void {
                 out.fail("no output contains {d},{d}\n", .{ point.x, point.y });
                 std.process.exit(1);
             };
-            const hex = color_mod.hexString(rgb);
-            out.print("{s}\n", .{hex});
-            publish(&app, "text/plain;charset=utf-8", &hex);
+            app.exit_code = deliver.colour(rgb, &app, copyText);
         },
         .shot => |rect| {
-            var canvas = try captureScreenshot(&app, rect);
-            defer canvas.deinit();
-            const bytes = try png.encode(allocator, canvas);
-            saveScreenshot(&app, bytes);
-            out.print("Screenshot copied to clipboard\n", .{});
-            publish(&app, "image/png", bytes);
+            app.exit_code = deliver.screenshot(allocator, app.surfaces, rect, app.save_dir, &app, copyImage);
         },
         .interactive => {
             try startOverlay(&app);
@@ -687,13 +677,13 @@ fn finish(self: *App, result: interaction_mod.Result) void {
     switch (result) {
         .color => |point| {
             const rgb = interaction_mod.colorAt(self.surfaces, point) orelse {
-                fail(self, "the pixel colour could not be read");
+                out.fail("the pixel colour could not be read\n", .{});
+                self.exit_code = 1;
+                self.quit = true;
                 return;
             };
-            const hex = color_mod.hexString(rgb);
-            out.print("{s}\n", .{hex});
             teardownOverlay(self);
-            publish(self, "text/plain;charset=utf-8", &hex);
+            self.exit_code = deliver.colour(rgb, self, copyText);
         },
         .screenshot => |rect| {
             self.pending_screenshot = rect;
@@ -701,111 +691,37 @@ fn finish(self: *App, result: interaction_mod.Result) void {
     }
 }
 
-/// Give up: report, set the exit code and let the event loop stop.
-fn fail(self: *App, message: []const u8) void {
-    out.fail("{s}\n", .{message});
-    self.exit_code = 1;
-    self.quit = true;
-}
-
 /// Copy a drag selection from the startup baseline and publish it.
 fn finishScreenshot(self: *App, rect: FRect) void {
     teardownOverlay(self);
-    var canvas = captureScreenshot(self, rect) catch |err| {
-        out.fail("screenshot failed: {t}\n", .{err});
-        self.exit_code = 1;
-        self.quit = true;
-        return;
-    };
-    defer canvas.deinit();
-    const bytes = png.encode(self.allocator, canvas) catch |err| {
-        out.fail("png encoding failed: {t}\n", .{err});
-        self.exit_code = 1;
-        self.quit = true;
-        return;
-    };
-    defer self.allocator.free(bytes);
-    saveScreenshot(self, bytes);
-    out.print("Screenshot copied to clipboard\n", .{});
-    publish(self, "image/png", bytes);
-}
-
-/// Write the PNG into `--save-dir` if one was given. The clipboard copy is
-/// unaffected: a failed save is reported and reflected in the exit code, but it
-/// does not stop the paste from working.
-fn saveScreenshot(self: *App, bytes: []const u8) void {
-    const dir = self.save_dir orelse return;
-    const path = save.writePng(self.allocator, dir, bytes) catch |err| {
-        out.fail("could not save screenshot to {s}: {t}\n", .{ dir, err });
-        self.exit_code = 1;
-        return;
-    };
-    defer self.allocator.free(path);
-    out.print("Screenshot saved to {s}\n", .{path});
-}
-
-/// Capture a global logical rectangle. The composition and the single-output
-/// shortcut both live in the shared interaction; this only supplies the
-/// per-output capture.
-fn captureScreenshot(self: *App, rect: FRect) !Canvas {
-    return interaction_mod.captureScreenshot(self.allocator, self.surfaces, rect, self, captureOne);
-}
-
-/// Crop one output's share from the baseline captured when the program started.
-fn captureOne(self: *App, surface: interaction_mod.SurfaceId, intersection: FRect) anyerror!Canvas {
-    const output = self.outputs.items[surface];
-    const baseline = output.baseline.?;
-    const source = Rect.roundF(.{
-        .x = (intersection.x - output.logical.x) * output.scale,
-        .y = (intersection.y - output.logical.y) * output.scale,
-        .w = intersection.w * output.scale,
-        .h = intersection.h * output.scale,
-    }).clamped(baseline.width, baseline.height);
-    if (source.isEmpty()) return error.EmptyCapture;
-
-    var captured = try Canvas.initUninitialized(
-        self.allocator,
-        @intCast(source.w),
-        @intCast(source.h),
-    );
-    errdefer captured.deinit();
-    var row: i32 = 0;
-    while (row < source.h) : (row += 1) {
-        const source_start = baseline.index(source.x, source.y + row);
-        const captured_start = captured.index(0, row);
-        const width: usize = @intCast(source.w);
-        @memcpy(
-            captured.pixels[captured_start .. captured_start + width],
-            baseline.pixels[source_start .. source_start + width],
-        );
-    }
-    return captured;
+    self.exit_code = deliver.screenshot(self.allocator, self.surfaces, rect, self.save_dir, self, copyImage);
 }
 
 // ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
 
-fn publish(self: *App, mime: [:0]const u8, payload: []const u8) void {
-    const manager = self.data_device_manager orelse {
-        fail(self, "this compositor has no clipboard support");
-        return;
-    };
-    const device = self.data_device orelse {
-        fail(self, "this compositor has no clipboard device");
-        return;
-    };
+fn copyText(self: *App, text: []const u8) !void {
+    try publish(self, "text/plain;charset=utf-8", text);
+}
 
-    const source = wl.dataDeviceManagerCreateSource(manager, self.data_device_manager_version) orelse {
-        self.quit = true;
-        return;
-    };
-    // The payload outlives the caller's stack frame: this process keeps serving
-    // the selection until the paste happens, so it has to own the bytes.
-    const owned = self.allocator.dupe(u8, payload) catch {
-        self.quit = true;
-        return;
-    };
+fn copyImage(self: *App, _: Canvas, png_bytes: []const u8) !void {
+    try publish(self, "image/png", png_bytes);
+}
+
+/// Offer `payload` as the selection. The process then keeps serving it until
+/// it is pasted or another client takes the selection over.
+fn publish(self: *App, mime: [:0]const u8, payload: []const u8) !void {
+    const manager = self.data_device_manager orelse return error.NoClipboardSupport;
+    const device = self.data_device orelse return error.NoClipboardDevice;
+
+    var grab: ?FocusGrab = if (self.serial == 0) try FocusGrab.open(self) else null;
+    defer if (grab) |*g| g.close();
+
+    // The payload outlives the caller's stack frame, so the process owns a copy.
+    const owned = try self.allocator.dupe(u8, payload);
+    const source = wl.dataDeviceManagerCreateSource(manager, self.data_device_manager_version) orelse
+        return error.OutOfMemory;
     wl.addListener(source, &data_source_listener, self);
     wl.dataSourceOffer(source, mime.ptr);
     wl.dataDeviceSetSelection(device, source, self.serial);
@@ -817,6 +733,61 @@ fn publish(self: *App, mime: [:0]const u8, payload: []const u8) void {
     self.clip_last_send_ms = null;
     self.clip_cancelled = false;
 }
+
+/// `wl_data_device.set_selection` wants the serial of an input event this
+/// client received, and compositors (wlroots among them) ignore a selection set
+/// with any other. The overlay has one from the click that ended it; `--pick`
+/// and `--shot` never see input, so they briefly map an invisible 1x1 layer
+/// surface that takes the keyboard, and use the serial of its
+/// `wl_keyboard.enter` (see `onKeyboardEnter`).
+const FocusGrab = struct {
+    surface: *wl.Obj,
+    layer_surface: *wl.Obj,
+    buffer: shm_mod.ShmBuffer = .{},
+
+    /// How long to wait for the keyboard to arrive before publishing anyway.
+    const timeout_ms: i64 = 500;
+
+    fn open(app: *App) !FocusGrab {
+        const layer_shell = app.layer_shell orelse return error.NoLayerShell;
+        const surface = wl.compositorCreateSurface(app.compositor.?, app.compositor_version) orelse
+            return error.OutOfMemory;
+        const layer_surface = wl.layerShellGetLayerSurface(
+            layer_shell,
+            app.layer_shell_version,
+            surface,
+            null,
+            wl.layer_overlay,
+            namespace,
+        ) orelse {
+            wl.surfaceDestroy(surface);
+            return error.OutOfMemory;
+        };
+        var grab = FocusGrab{ .surface = surface, .layer_surface = layer_surface };
+        errdefer grab.close();
+
+        wl.addListener(layer_surface, &focus_layer_listener, app);
+        wl.layerSurfaceSetSize(layer_surface, 1, 1);
+        wl.layerSurfaceSetKeyboardInteractivity(layer_surface, wl.keyboard_interactivity_exclusive);
+        wl.surfaceCommit(surface);
+        try roundtrip(app); // configure, acked by onFocusConfigure
+
+        // A fresh shm buffer is zeroed, which is fully transparent ARGB.
+        try grab.buffer.createUntracked(app.shm.?, app.shm_version, 1, 1, wl.shm_format_argb8888, 4);
+        wl.surfaceAttach(surface, grab.buffer.buffer, 0, 0);
+        wl.surfaceCommit(surface);
+
+        const deadline = nowMs() + timeout_ms;
+        while (app.serial == 0 and nowMs() < deadline) try wl.pump(app.display, 20);
+        return grab;
+    }
+
+    fn close(self: *FocusGrab) void {
+        wl.layerSurfaceDestroy(self.layer_surface);
+        wl.surfaceDestroy(self.surface);
+        self.buffer.destroy();
+    }
+};
 
 fn clipboardExpired(self: *App) bool {
     if (self.clip_source == null) return false;
@@ -1077,6 +1048,18 @@ fn onLayerConfigure(
     self.setLogicalSize(@intCast(width), @intCast(height));
     wl.layerSurfaceAckConfigure(layer_surface.?, serial);
     self.configured = true;
+}
+
+const focus_layer_listener = LayerSurfaceListener{
+    .configure = onFocusConfigure,
+    .closed = @ptrCast(&wl.noop),
+};
+
+fn onFocusConfigure(data: ?*anyopaque, layer_surface: ?*wl.Obj, serial: u32, width: u32, height: u32) callconv(.c) void {
+    _ = data;
+    _ = width;
+    _ = height;
+    wl.layerSurfaceAckConfigure(layer_surface.?, serial);
 }
 
 fn onLayerClosed(data: ?*anyopaque, layer_surface: ?*wl.Obj) callconv(.c) void {
@@ -1447,12 +1430,22 @@ const KeyboardListener = extern struct {
 
 const keyboard_listener = KeyboardListener{
     .keymap = onKeyboardKeymap,
-    .enter = @ptrCast(&wl.noop),
+    .enter = onKeyboardEnter,
     .leave = @ptrCast(&wl.noop),
     .key = onKeyboardKey,
     .modifiers = @ptrCast(&wl.noop),
     .repeat_info = @ptrCast(&wl.noop),
 };
+
+/// Keyboard focus arriving is an input event too, and its serial is as good as
+/// a click's for claiming the selection; `FocusGrab` relies on it.
+fn onKeyboardEnter(data: ?*anyopaque, keyboard: ?*wl.Obj, serial: u32, surface: ?*wl.Obj, keys: ?*anyopaque) callconv(.c) void {
+    _ = keyboard;
+    _ = surface;
+    _ = keys;
+    const app: *App = @ptrCast(@alignCast(data.?));
+    app.serial = serial;
+}
 
 fn onKeyboardKeymap(
     data: ?*anyopaque,

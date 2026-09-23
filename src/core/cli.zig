@@ -1,12 +1,11 @@
-//! Command line parsing, shared by both frontends so they accept exactly the
+//! Command line parsing, shared by every frontend so they accept exactly the
 //! same flags.
 
 const std = @import("std");
 const geom = @import("geom.zig");
 const out = @import("out.zig");
 
-/// Single source of truth for the version: the macOS installer reads this line
-/// out of the source to fill CFBundleShortVersionString.
+/// Single source of truth for the version, printed by `--version`.
 pub const version = "0.1.0";
 
 /// Logical pixels of overlay cursor travel per unit of raw pointer delta. At 1
@@ -83,7 +82,9 @@ pub fn parse(args: []const []const u8) Parsed {
             command = .{ .pick = parsePoint(value) orelse return .{ .invalid = "--pick needs X,Y" } };
         } else if (std.mem.eql(u8, arg, "--shot")) {
             const value = rest.next() orelse return .{ .invalid = "--shot needs X,Y,W,H" };
-            command = .{ .shot = parseRect(value) orelse return .{ .invalid = "--shot needs X,Y,W,H" } };
+            const rect = parseRect(value) orelse return .{ .invalid = "--shot needs X,Y,W,H" };
+            if (rect.isEmpty()) return .{ .invalid = "--shot needs a positive W and H" };
+            command = .{ .shot = rect };
         } else if (std.mem.eql(u8, arg, "--save-dir")) {
             const value = rest.next() orelse return .{ .invalid = "--save-dir needs a directory" };
             if (value.len == 0) return .{ .invalid = "--save-dir needs a directory" };
@@ -160,12 +161,21 @@ fn parseRect(value: []const u8) ?geom.FRect {
     return .{ .x = v[0], .y = v[1], .w = v[2], .h = v[3] };
 }
 
-/// Exactly `N` comma-separated floats, no more, no less.
+/// Largest magnitude a logical coordinate or size may have. Far beyond any real
+/// desktop, and small enough that scaling it to physical pixels and rounding it
+/// into an `i32`/`u32` can never overflow (which would be undefined behaviour
+/// in a release build, not an error).
+const max_coordinate: f64 = 1_000_000;
+
+/// Exactly `N` comma-separated finite floats within `max_coordinate`, no more,
+/// no less.
 fn parseFloats(comptime N: usize, value: []const u8) ?[N]f64 {
     var result: [N]f64 = undefined;
     var parts = std.mem.splitScalar(u8, value, ',');
     for (&result) |*slot| {
-        slot.* = std.fmt.parseFloat(f64, parts.next() orelse return null) catch return null;
+        const number = std.fmt.parseFloat(f64, parts.next() orelse return null) catch return null;
+        if (!std.math.isFinite(number) or @abs(number) > max_coordinate) return null;
+        slot.* = number;
     }
     if (parts.next() != null) return null;
     return result;

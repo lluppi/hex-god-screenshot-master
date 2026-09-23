@@ -1,8 +1,8 @@
 //! `wl_shm` buffers: anonymous memory the compositor can read pixels from.
 //!
 //! Every drawing surface gets two of these so a frame can be composed while the
-//! compositor still reads the previous one. A buffer only becomes writable
-//! again after `wl_buffer.release`, which is why `released` is tracked here.
+//! compositor still reads the previous one. `released` tracks
+//! `wl_buffer.release` so a free buffer can be preferred.
 
 const std = @import("std");
 const wl = @import("wl.zig");
@@ -21,9 +21,9 @@ pub const ShmBuffer = struct {
     height: u32 = 0,
     stride: u32 = 0,
     format: u32 = 0,
-    /// Set when the compositor says it is done with this buffer. Informational:
-    /// frame pacing is done with `wl_surface.frame` (see linux/app.zig), because
-    /// a compositor may hold the buffer it is displaying indefinitely.
+    /// Set when the compositor says it is done with this buffer. Only a
+    /// preference, never waited on: a compositor may hold the buffer it is
+    /// displaying indefinitely (see `flushOutput` in linux/app.zig).
     released: bool = true,
 
     /// A drawing view over the mapped memory. Only valid when `stride` is
@@ -122,8 +122,7 @@ pub const ShmBuffer = struct {
         };
     }
 
-    /// A drawing view over the mapped memory, only valid when the stride is
-    /// tightly packed.
+    /// Release everything `create` made; safe on a buffer never created.
     pub fn destroy(self: *ShmBuffer) void {
         if (self.buffer) |buffer| wl.bufferDestroy(buffer);
         if (self.pool) |pool| wl.shmPoolDestroy(pool);

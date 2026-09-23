@@ -1,4 +1,4 @@
-//! Geometry shared by both frontends.
+//! Geometry shared by every frontend.
 //!
 //! Two coordinate spaces are in play everywhere:
 //!
