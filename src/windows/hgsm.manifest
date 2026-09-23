@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="hgsm" version="0.1.1.0" processorArchitecture="*"/>
+  <assemblyIdentity type="win32" name="hgsm" version="0.1.2.0" processorArchitecture="*"/>
 
   <!-- Per-monitor-v2, declared before any code runs: without it windows hands
        the process virtualised monitor rectangles and cursor positions, and an

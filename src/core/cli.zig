@@ -6,7 +6,7 @@ const geom = @import("geom.zig");
 const out = @import("out.zig");
 
 /// Single source of truth for the version, printed by `--version`.
-pub const version = "0.1.1";
+pub const version = "0.1.2";
 
 /// Logical pixels of overlay cursor travel per unit of raw pointer delta. At 1
 /// it moves as fast as the compositor's own cursor; below 1 it is deliberately
