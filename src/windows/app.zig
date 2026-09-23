@@ -1147,8 +1147,8 @@ fn copyText(text: []const u8) void {
     const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, text) catch return;
     defer std.heap.page_allocator.free(wide);
 
-    if (!openClipboard()) return;
-    defer _ = win32.CloseClipboard();
+    const owner = openClipboard() orelse return;
+    defer closeClipboard(owner);
     if (win32.EmptyClipboard() == 0) return;
 
     const memory = wideMemory(wide) orelse return;
@@ -1161,13 +1161,40 @@ fn copyText(text: []const u8) void {
 /// constantly - a clipboard manager, a launcher, Parallels' own sharing agent -
 /// so `OpenClipboard` failing is routine rather than exceptional. This tool
 /// exists to put one thing on the clipboard; it is worth waiting for it.
-fn openClipboard() bool {
+///
+/// The clipboard must be opened against a real window: with a null owner,
+/// `EmptyClipboard` leaves the clipboard ownerless and every following
+/// `SetClipboardData` fails. The overlays may already be hidden or never exist
+/// (the `pick`/`shot` commands), so a throwaway message-only window is used as
+/// the owner. Data set without delayed rendering outlives that window.
+fn openClipboard() ?win32.HWND {
+    const owner = win32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.hwnd_message,
+        null,
+        win32.GetModuleHandleW(null),
+        null,
+    ) orelse return null;
+
     var attempt: u8 = 0;
     while (attempt < clipboard_attempts) : (attempt += 1) {
-        if (win32.OpenClipboard(null) != 0) return true;
+        if (win32.OpenClipboard(owner) != 0) return owner;
         win32.Sleep(clipboard_retry_ms);
     }
-    return false;
+    _ = win32.DestroyWindow(owner);
+    return null;
+}
+
+fn closeClipboard(owner: win32.HWND) void {
+    _ = win32.CloseClipboard();
+    _ = win32.DestroyWindow(owner);
 }
 
 const clipboard_attempts: u8 = 20;
@@ -1192,8 +1219,8 @@ fn wideMemory(wide: [:0]const u16) ?win32.HGLOBAL {
 /// and image editors ask for, and the only one that survives transparency and
 /// exact bytes). One clipboard generation, two formats.
 fn copyScreenshot(canvas: Canvas, png_bytes: []const u8) void {
-    if (!openClipboard()) return;
-    defer _ = win32.CloseClipboard();
+    const owner = openClipboard() orelse return;
+    defer closeClipboard(owner);
     if (win32.EmptyClipboard() == 0) return;
 
     if (dibMemory(canvas)) |memory| {

@@ -188,6 +188,9 @@ pub const pm_remove: UINT = 0x0001;
 pub const qs_allinput: UINT = 0x04FF;
 pub const mwmo_inputavailable: DWORD = 0x0004;
 
+/// `HWND_MESSAGE`, i.e. `(HWND)-3`: the parent that makes a window message-only.
+pub const hwnd_message: HWND = @ptrFromInt(std.math.maxInt(usize) - 2);
+
 pub const cf_dib: UINT = 8;
 pub const cf_unicode_text: UINT = 13;
 
