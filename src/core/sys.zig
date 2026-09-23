@@ -26,6 +26,7 @@ const clock_monotonic: c_int = switch (builtin.os.tag) {
 const clock_realtime: c_int = 0;
 
 pub fn writeAll(fd: c_int, bytes: []const u8) void {
+    if (builtin.os.tag == .windows) return windows.writeAll(fd, bytes);
     var remaining = bytes;
     while (remaining.len > 0) {
         const written = write(fd, remaining.ptr, remaining.len);
@@ -35,6 +36,45 @@ pub fn writeAll(fd: c_int, bytes: []const u8) void {
         remaining = remaining[@intCast(written)..];
     }
 }
+
+/// Stdout and stderr on windows go straight to the standard handles. A
+/// windows-subsystem process started from a shortcut, explorer or a hotkey has
+/// no standard handles, and the CRT treats a write to an unbound descriptor as
+/// an invalid parameter and kills the process on the spot - after a screenshot
+/// was saved but before it was copied, or before a picked colour was copied at
+/// all. With no handle there is nowhere to print, so the line is dropped.
+const windows = struct {
+    const HANDLE = *anyopaque;
+    const std_output_handle: u32 = 0xFFFF_FFF5;
+    const std_error_handle: u32 = 0xFFFF_FFF4;
+    const invalid_handle_value: usize = std.math.maxInt(usize);
+
+    extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn WriteFile(
+        file: HANDLE,
+        buffer: [*]const u8,
+        count: u32,
+        written: *u32,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) c_int;
+
+    fn writeAll(fd: c_int, bytes: []const u8) void {
+        const which = switch (fd) {
+            1 => std_output_handle,
+            2 => std_error_handle,
+            else => return,
+        };
+        const handle = GetStdHandle(which) orelse return;
+        if (@intFromPtr(handle) == invalid_handle_value) return;
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            var written: u32 = 0;
+            const count: u32 = @intCast(@min(remaining.len, std.math.maxInt(u32)));
+            if (WriteFile(handle, remaining.ptr, count, &written, null) == 0 or written == 0) return;
+            remaining = remaining[written..];
+        }
+    }
+};
 
 pub fn closeFd(fd: c_int) void {
     _ = close(fd);
