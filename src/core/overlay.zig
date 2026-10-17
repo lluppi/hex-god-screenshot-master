@@ -92,11 +92,15 @@ fn paintDifferenceRect(canvas: *Canvas, rect: Rect) void {
 }
 
 /// luma is 0..255000, so mid grey is half that. Around mid grey an inverted
-/// colour barely moves, which is the one band where the difference edge needs a
-/// higher-contrast neutral instead.
+/// colour barely moves, so inside the dead zone the difference edge fades from
+/// the inverse towards a higher-contrast neutral instead of snapping to it.
 const luma_mid = 127_500;
 const luma_full = 255_000;
 const luma_dead_zone = 64_000;
+/// Half-width of the band around mid grey where that neutral crossfades from
+/// white (darker side) to black (lighter side). Only here does the edge lose
+/// contrast, in exchange for never flipping abruptly across a gradient.
+const luma_neutral_band = 8_000;
 
 /// The dimensions readout is drawn a touch smaller than the loupe's, so it reads
 /// as a secondary instrument.
@@ -111,11 +115,28 @@ fn differenceInk(pixel: u32) u32 {
     const rgb = color.rgbOf(pixel);
     const luma = color.luma(rgb);
     const inverse_delta = if (luma >= luma_mid) 2 * luma - luma_full else luma_full - 2 * luma;
+    const inverse: color.Rgb = .{ .r = 0xff - rgb.r, .g = 0xff - rgb.g, .b = 0xff - rgb.b };
+    if (inverse_delta >= luma_dead_zone) return color.solid(inverse);
 
-    if (inverse_delta < luma_dead_zone) {
-        return color.solid(if (luma >= luma_mid) color.black_rgb else color.white);
-    }
-    return color.solid(.{ .r = 0xff - rgb.r, .g = 0xff - rgb.g, .b = 0xff - rgb.b });
+    // 0 = white, 255 = black, ramping linearly across the neutral band.
+    const band_low = luma_mid - luma_neutral_band;
+    const band_high = luma_mid + luma_neutral_band;
+    const neutral_level: u32 = if (luma <= band_low)
+        0xff
+    else if (luma >= band_high)
+        0
+    else
+        0xff - ((luma - band_low) * 0xff) / (band_high - band_low);
+    const neutral: color.Rgb = .{ .r = @intCast(neutral_level), .g = @intCast(neutral_level), .b = @intCast(neutral_level) };
+
+    // Weight of the inverse: 0 at mid grey, 1 at the dead zone's edge.
+    const weight = inverse_delta;
+    const keep = luma_dead_zone - inverse_delta;
+    return color.solid(.{
+        .r = @intCast((@as(u32, inverse.r) * weight + @as(u32, neutral.r) * keep) / luma_dead_zone),
+        .g = @intCast((@as(u32, inverse.g) * weight + @as(u32, neutral.g) * keep) / luma_dead_zone),
+        .b = @intCast((@as(u32, inverse.b) * weight + @as(u32, neutral.b) * keep) / luma_dead_zone),
+    });
 }
 
 /// The endpoint instrument's geometry: where the dimensions plate goes, and the

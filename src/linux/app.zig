@@ -1284,6 +1284,11 @@ fn onPointerEnter(
     hideCursor(app);
     const o = outputForSurface(app, surface) orelse return;
     const local = Point{ .x = wl.fixedToFloat(surface_x), .y = wl.fixedToFloat(surface_y) };
+    // Hyprland can hand the first-mapped overlay an enter the pointer is not
+    // actually over, with coordinates far outside it. Anchoring on that would
+    // park the fine cursor (and the lock) on the nearest edge, so wait for the
+    // enter on the surface the pointer really is over.
+    if (local.x < 0 or local.y < 0 or local.x >= o.logical.w or local.y >= o.logical.h) return;
     if (app.interaction) |*interaction| {
         if (interaction.fineActive()) return;
     }
