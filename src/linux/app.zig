@@ -508,8 +508,11 @@ fn teardownOverlay(self: *App) void {
 // Painting
 // ---------------------------------------------------------------------------
 
-/// Queue a repaint of one output's region and flush it. This is the frontend's
-/// whole implementation of the shared `PaintFn`.
+/// Queue a repaint of one output's region. This is the frontend's whole
+/// implementation of the shared `PaintFn`. The flush happens once per event
+/// loop pass (see `eventLoop`), so a burst of pointer events from a high rate
+/// mouse costs one render and one commit instead of one each - rendering per
+/// event fell behind the mouse and left the drag lagging for seconds.
 fn paintOutput(ctx: *anyopaque, surface: interaction_mod.SurfaceId, region: Rect) void {
     const self: *App = @ptrCast(@alignCast(ctx));
     const o = self.outputs.items[surface];
@@ -521,9 +524,28 @@ fn paintOutput(ctx: *anyopaque, surface: interaction_mod.SurfaceId, region: Rect
     if (clipped.isEmpty()) return;
     var i: usize = 0;
     while (i < 2) : (i += 1) {
-        o.dirty[i].append(o.app.allocator, clipped) catch return;
+        queueDirty(&o.dirty[i], o.app.allocator, clipped);
     }
-    flushOutput(o);
+}
+
+/// Add a region to a dirty list, folding it into an overlapping entry when the
+/// union wastes no area. A burst of events re-damages nearly the same edge
+/// strips over and over; folding keeps those from overflowing `MAX_DIRTY`, where
+/// the excess would be merged into one bounding box covering the whole box.
+fn queueDirty(list: *std.ArrayList(Rect), allocator: std.mem.Allocator, region: Rect) void {
+    for (list.items) |*existing| {
+        if (!existing.intersects(region)) continue;
+        const merged = existing.unionWith(region);
+        if (area(merged) <= area(existing.*) + area(region)) {
+            existing.* = merged;
+            return;
+        }
+    }
+    list.append(allocator, region) catch return;
+}
+
+fn area(rect: Rect) i64 {
+    return @as(i64, rect.w) * @as(i64, rect.h);
 }
 
 fn flushAll(self: *App) void {

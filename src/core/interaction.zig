@@ -241,7 +241,8 @@ pub const Interaction = struct {
 
         var damages: std.ArrayList(Damage) = .empty;
         errdefer damages.deinit(allocator);
-        try damages.ensureTotalCapacity(allocator, @max(surfaces.len, 2));
+        // Per surface: four edge bands plus the badge/fallback rectangle.
+        try damages.ensureTotalCapacity(allocator, @max(surfaces.len * 5, 2));
 
         return .{
             .allocator = allocator,
@@ -444,9 +445,18 @@ pub const Interaction = struct {
     fn planSelectionDamage(self: *Interaction, previous: ?FRect, next: ?FRect) void {
         for (self.surfaces, 0..) |*surface, index| {
             var damage = Rect{};
-            if (self.selectionPhysical(index, previous)) |rect| damage = damage.unionWith(rect);
+            const before = self.selectionPhysical(index, previous);
             const selection = self.selectionPhysical(index, next);
-            if (selection) |rect| damage = damage.unionWith(rect);
+            if (before != null and selection != null) {
+                // Only the bands between the old and new edges change: the
+                // interior stays undimmed and the exterior stays dimmed. Repainting
+                // the whole box on every pointer event is what made big drags on a
+                // large display crawl.
+                self.appendEdgeBands(index, before.?, selection.?, geom.px(uiScale(surface.config), 1) + 3);
+            } else {
+                if (before) |rect| damage = damage.unionWith(rect);
+                if (selection) |rect| damage = damage.unionWith(rect);
+            }
             if (surface.last_badge) |badge| damage = damage.unionWith(badge);
             surface.last_badge = null;
 
@@ -460,6 +470,30 @@ pub const Interaction = struct {
                 }
             }
             if (!damage.isEmpty()) self.appendDamage(index, damage.expand(3));
+        }
+    }
+
+    /// Damage the strip swept by each edge that moved from `a` to `b`, spanning
+    /// the union of both rectangles and widened by `pad` so the difference frame
+    /// on either side is repainted too. Together the strips cover the symmetric
+    /// difference of the two rectangles.
+    fn appendEdgeBands(self: *Interaction, surface: SurfaceId, a: Rect, b: Rect, pad: i32) void {
+        const all = a.unionWith(b);
+        if (a.x != b.x) {
+            const x0 = @min(a.x, b.x);
+            self.appendDamage(surface, (Rect{ .x = x0, .y = all.y, .w = @max(a.x, b.x) - x0, .h = all.h }).expand(pad));
+        }
+        if (a.maxX() != b.maxX()) {
+            const x0 = @min(a.maxX(), b.maxX());
+            self.appendDamage(surface, (Rect{ .x = x0, .y = all.y, .w = @max(a.maxX(), b.maxX()) - x0, .h = all.h }).expand(pad));
+        }
+        if (a.y != b.y) {
+            const y0 = @min(a.y, b.y);
+            self.appendDamage(surface, (Rect{ .x = all.x, .y = y0, .w = all.w, .h = @max(a.y, b.y) - y0 }).expand(pad));
+        }
+        if (a.maxY() != b.maxY()) {
+            const y0 = @min(a.maxY(), b.maxY());
+            self.appendDamage(surface, (Rect{ .x = all.x, .y = y0, .w = all.w, .h = @max(a.maxY(), b.maxY()) - y0 }).expand(pad));
         }
     }
 
